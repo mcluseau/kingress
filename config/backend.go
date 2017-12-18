@@ -1,13 +1,13 @@
 package config
 
 import (
+	"math/rand"
 	"strings"
 )
 
 type Backend struct {
 	prefix  string
 	targets []string
-	n       int
 }
 
 func NewBackend(prefix string, targets ...string) *Backend {
@@ -30,8 +30,7 @@ func (b *Backend) Target() string {
 		return ""
 	}
 
-	target := b.targets[b.n%len(b.targets)]
-	b.n += 1
+	target := b.targets[rand.Intn(len(b.targets))]
 
 	return target
 }
