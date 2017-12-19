@@ -29,7 +29,7 @@ type HttpHandler struct {
 func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodConnect:
-		log.Print("%s: %v tried to use method %s", r.Proto, r.RemoteAddr, r.Method)
+		log.Printf("%s: %v tried to use method %s", r.Proto, r.RemoteAddr, r.Method)
 		return
 	}
 
