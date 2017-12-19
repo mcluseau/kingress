@@ -1,6 +1,9 @@
 package k8s
 
 import (
+	"log"
+	"strings"
+
 	ext "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -17,6 +20,7 @@ type ingressRule struct {
 	Path    string
 	Service string
 	Port    intstr.IntOrString
+	Options *config.BackendOptions
 }
 
 type ingressTLS struct {
@@ -41,6 +45,36 @@ func (h ingressHandler) OnDelete(obj interface{}) {
 func (_ ingressHandler) update(ing *ext.Ingress) {
 	ref := k8sRef(ing)
 
+	// parse ingress options
+	opts := &config.BackendOptions{}
+	for key, value := range ing.Annotations {
+		keyParts := strings.SplitN(key, "/", 2)
+
+		if len(keyParts) != 2 {
+			continue
+		}
+
+		shouldBeKnown := false
+		switch keyParts[0] {
+		case "kubernetes.io":
+		// ok
+
+		case "ingress.kubernetes.io", "nginx.ingress.kubernetes.io":
+			shouldBeKnown = true
+
+		default:
+			continue
+		}
+
+		known, err := opts.Set(keyParts[1], value)
+		if err != nil {
+			log.Printf("warning: ingress %s: error parsing annotation %s: %s", ref, key, err)
+
+		} else if shouldBeKnown && !known {
+			log.Printf("warning: ingress %s: unknown annotation: %s", ref, key)
+		}
+	}
+
 	rules := make([]ingressRule, 0)
 
 	// Collect host,path->target associations
@@ -51,6 +85,7 @@ func (_ ingressHandler) update(ing *ext.Ingress) {
 				Path:    path.Path,
 				Service: ing.Namespace + "/" + path.Backend.ServiceName,
 				Port:    path.Backend.ServicePort,
+				Options: opts,
 			})
 		}
 	}

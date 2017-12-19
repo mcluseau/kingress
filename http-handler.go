@@ -47,7 +47,7 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	backend, target, status := getBackend(r)
-	if target == "" {
+	if status != 0 {
 		// no backend matching
 		http.Error(w, http.StatusText(status), status)
 		return
@@ -55,6 +55,12 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	req.logf("remote=%s host=%s ingress=%s target=%s method=%s uri=%q proto=%q",
 		r.RemoteAddr, r.Host, backend.IngressRef, target, r.Method, r.RequestURI, r.Proto)
+
+	if backend.Options.SSLRedirect && hh.Proto == "http" {
+		req.logf("redirecting to HTTPS")
+		redirectToHTTPS(w, r)
+		return
+	}
 
 	hijacker := w.(http.Hijacker)
 	clientConn, clientRW, err := hijacker.Hijack()
@@ -64,21 +70,20 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	destConn, err := net.DialTimeout("tcp", target, dialTimeout)
-	if err != nil {
+	if err = req.dialTarget(target); err != nil {
 		req.logf("dial error: %s", err)
 		writeError(r, clientConn, http.StatusBadGateway)
 		return
 	}
 
-	if err = req.writeHeaders(r, destConn); err != nil {
+	if err = req.writeHeaders(r); err != nil {
 		req.logf("error writing headers: %s", err)
 		writeError(r, clientConn, http.StatusBadGateway)
 		return
 	}
 
-	go req.copy(&req.bytesOut, clientRW, destConn, clientConn)
-	go req.copy(&req.bytesIn, destConn, clientRW, destConn)
+	go req.proxy(&req.bytesOut, clientConn.(proxyDestination), req.target)
+	go req.proxy(&req.bytesIn, req.target, clientRW)
 }
 
 func writeError(r *http.Request, out io.WriteCloser, code int) {

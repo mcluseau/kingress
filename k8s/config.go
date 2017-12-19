@@ -35,6 +35,10 @@ func newConfig() config.Config {
 			// build the backend from the service endpoints
 			backend := config.NewBackend(ingRef, rule.Path, findEndpoints(rule.Service, targetPort)...)
 
+			if rule.Options != nil {
+				backend.Options = *rule.Options
+			}
+
 			newBackends[rule.Host] = append(backends, backend)
 		}
 	}

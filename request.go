@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,7 +19,9 @@ type request struct {
 	id       string
 	start    time.Time
 
-	copyCount         int
+	target proxyDestination
+
+	proxyCount        int
 	lock              sync.Mutex
 	bytesIn, bytesOut int64
 }
@@ -43,22 +46,41 @@ func (r *request) logf(pattern string, args ...interface{}) {
 	log.Printf("endpoints=%s req=%s time=%s time-ns=%d "+pattern, allArgs...)
 }
 
-func (r *request) copy(counter *int64, dst io.Writer, src io.Reader, conn io.Closer) {
+func (r *request) dialTarget(target string) error {
+	c, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		return err
+	}
+	r.target = c.(proxyDestination)
+	return nil
+}
+
+type proxyDestination interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	CloseWrite() error
+}
+
+func (r *request) proxy(counter *int64, dst proxyDestination, src io.Reader) {
 	defer func() {
-		conn.Close()
+		dst.CloseWrite()
 
 		r.lock.Lock()
 		defer r.lock.Unlock()
 
-		r.copyCount -= 1
+		r.proxyCount -= 1
 
-		if r.copyCount == 0 {
-			r.logf("bytes-in=%d bytes-out=%d closed", r.bytesIn, r.bytesOut)
+		if r.proxyCount != 0 {
+			return
 		}
+
+		r.target.Close()
+		r.logf("bytes-in=%d bytes-out=%d closed", r.bytesIn, r.bytesOut)
 	}()
 
 	r.lock.Lock()
-	r.copyCount += 1
+	r.proxyCount += 1
 	r.lock.Unlock()
 
 	nb, err := io.Copy(dst, src)
@@ -76,7 +98,7 @@ func (r *request) copy(counter *int64, dst io.Writer, src io.Reader, conn io.Clo
 	}
 }
 
-func (req *request) writeHeaders(r *http.Request, out io.Writer) (err error) {
+func (req *request) writeHeaders(r *http.Request) (err error) {
 	buf := bytes.NewBuffer(make([]byte, 0, 4096))
 
 	if _, err = fmt.Fprintf(buf, "%s %s %s\r\n", r.Method, r.URL.RequestURI(), r.Proto); err != nil {
@@ -115,7 +137,7 @@ func (req *request) writeHeaders(r *http.Request, out io.Writer) (err error) {
 
 	req.bytesIn += int64(buf.Len())
 
-	if _, err = buf.WriteTo(out); err != nil {
+	if _, err = buf.WriteTo(req.target); err != nil {
 		return
 	}
 	return

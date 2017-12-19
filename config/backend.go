@@ -9,6 +9,8 @@ type Backend struct {
 	IngressRef string
 	prefix     string
 	targets    []string
+
+	Options BackendOptions
 }
 
 func NewBackend(ingressRef, prefix string, targets ...string) *Backend {

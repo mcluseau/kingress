@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,8 +14,9 @@ import (
 )
 
 var (
-	httpBind  = flag.String("http", ":80", "HTTP bind specification")
-	httpsBind = flag.String("https", ":443", "HTTPS bind specification")
+	httpBind     = flag.String("http", ":80", "HTTP bind specification")
+	httpsBind    = flag.String("https", ":443", "HTTPS bind specification")
+	sslRedirBind = flag.String("ssl-redirect", ":81", "HTTP to HTTPS redirector bind specification")
 )
 
 func main() {
@@ -28,14 +30,22 @@ func main() {
 
 	k8s.Start()
 
+	// HTTP
 	go func() {
 		err := startHTTP(*httpBind)
 		log.Fatal("http handler finished: ", err)
 	}()
 
+	// HTTPS
 	go func() {
 		err := startHTTPS(*httpsBind)
 		log.Fatal("https handler finished: ", err)
+	}()
+
+	// HTTP to HTTPS
+	go func() {
+		err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
+		log.Fatal("ssl redirect handler finished: ", err)
 	}()
 
 	sigs := make(chan os.Signal, 1)

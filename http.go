@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -9,11 +8,7 @@ import (
 )
 
 var (
-	headerReadTimeout = 1 * time.Minute
-	timeZero          = time.Time{}
-	dialTimeout       = 1 * time.Minute
-
-	ErrBadRequestLine = errors.New("request line too large")
+	dialTimeout = 1 * time.Minute
 )
 
 func startHTTP(bind string) error {
