@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strconv"
 
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 func portOfBind(bind string) string {

@@ -5,7 +5,7 @@ import (
 	"log"
 	"sort"
 
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 func newConfig() config.Config {

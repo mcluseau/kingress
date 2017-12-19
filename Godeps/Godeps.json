@@ -1,5 +1,5 @@
 {
-	"ImportPath": "github.com/MikaelCluseau/kingress",
+	"ImportPath": "github.com/mcluseau/kingress",
 	"GoVersion": "go1.9",
 	"GodepVersion": "v79",
 	"Deps": [

@@ -6,7 +6,7 @@ import (
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 var (

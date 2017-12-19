@@ -4,7 +4,7 @@ import (
 	ext "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 var (

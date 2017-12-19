@@ -5,7 +5,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 func startHTTPS(bind string) error {

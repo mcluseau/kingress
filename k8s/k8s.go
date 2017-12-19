@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MikaelCluseau/kingress/kubeclient"
+	"github.com/mcluseau/kingress/kubeclient"
 	corev1 "k8s.io/api/core/v1"
 	extv1b1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

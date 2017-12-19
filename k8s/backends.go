@@ -1,7 +1,7 @@
 package k8s
 
 import (
-	"github.com/MikaelCluseau/kingress/config"
+	"github.com/mcluseau/kingress/config"
 )
 
 type backendsOrder []*config.Backend

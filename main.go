@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MikaelCluseau/kingress/k8s"
+	"github.com/mcluseau/kingress/k8s"
 )
 
 var (
