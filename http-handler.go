@@ -56,6 +56,34 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req.logf("remote=%s host=%s ingress=%s target=%s method=%s uri=%q proto=%q",
 		r.RemoteAddr, r.Host, backend.IngressRef, target, r.Method, r.RequestURI, r.Proto)
 
+	// check for whitelist
+	if backend.Options.WhitelistSourceRange != nil {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			panic(err) // not possible (built by net/http)
+		}
+
+		remoteIP := net.ParseIP(host)
+		if remoteIP == nil {
+			panic("remote IP shouldn't be nil") // not possible (IP is obtained from socket)
+		}
+
+		accessOk := false
+		for _, ipnet := range backend.Options.WhitelistSourceRange {
+			if ipnet.Contains(remoteIP) {
+				accessOk = true
+				break
+			}
+		}
+
+		if !accessOk {
+			req.logf("rejecting (not in whitelist)")
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+
+	// check for SSL redirection
 	if backend.Options.SSLRedirect && hh.Proto == "http" {
 		req.logf("redirecting to HTTPS")
 		redirectToHTTPS(w, r)
