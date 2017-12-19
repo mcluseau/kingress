@@ -3,9 +3,11 @@ package main
 import (
 	"flag"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/MikaelCluseau/kingress/k8s"
 )
@@ -20,6 +22,9 @@ func main() {
 	flag.Parse()
 
 	log.Print("Starting...")
+
+	// TODO init from crypto/rand
+	rand.Seed(time.Now().UnixNano())
 
 	k8s.Start()
 

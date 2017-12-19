@@ -3,6 +3,7 @@ package k8s
 import (
 	"crypto/tls"
 	"log"
+	"sort"
 
 	"github.com/MikaelCluseau/kingress/config"
 )
@@ -32,10 +33,15 @@ func newConfig() config.Config {
 			}
 
 			// build the backend from the service endpoints
-			backend := config.NewBackend(rule.Path, findEndpoints(rule.Service, targetPort)...)
+			backend := config.NewBackend(ingRef, rule.Path, findEndpoints(rule.Service, targetPort)...)
 
 			newBackends[rule.Host] = append(backends, backend)
 		}
+	}
+
+	// Sort each host's backends by reverse length
+	for _, backends := range newBackends {
+		sort.Sort(backendsOrder(backends))
 	}
 
 	newCerts := map[string]*tls.Certificate{}

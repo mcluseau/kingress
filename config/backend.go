@@ -6,14 +6,16 @@ import (
 )
 
 type Backend struct {
-	prefix  string
-	targets []string
+	IngressRef string
+	prefix     string
+	targets    []string
 }
 
-func NewBackend(prefix string, targets ...string) *Backend {
+func NewBackend(ingressRef, prefix string, targets ...string) *Backend {
 	return &Backend{
-		prefix:  prefix,
-		targets: targets,
+		IngressRef: ingressRef,
+		prefix:     prefix,
+		targets:    targets,
 	}
 }
 

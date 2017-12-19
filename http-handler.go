@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -9,7 +8,6 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
-	"strings"
 
 	"github.com/MikaelCluseau/kingress/config"
 )
@@ -29,10 +27,13 @@ type HttpHandler struct {
 }
 
 func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodConnect {
+	switch r.Method {
+	case http.MethodConnect:
 		log.Print("%s: %v tried to use method %s", r.Proto, r.RemoteAddr, r.Method)
 		return
 	}
+
+	req := newRequest(hh.Proto)
 
 	var clientConn net.Conn
 
@@ -41,104 +42,55 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
-			log.Printf("%s: panic serving %v: %v\n%s", r.Proto, r.RemoteAddr, err, buf)
+			req.logf("panic: %v\n%s", err, buf)
 		}
 	}()
 
-	hijacker := w.(http.Hijacker)
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		writeError(r, clientConn, http.StatusServiceUnavailable)
+	backend, target, status := getBackend(r)
+	if target == "" {
+		// no backend matching
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
-	target, status := getBackend(r)
-	if target == "" {
-		// no backend matching
-		writeError(r, clientConn, status)
+	req.logf("remote=%s host=%s ingress=%s target=%s method=%s uri=%q proto=%q",
+		r.RemoteAddr, r.Host, backend.IngressRef, target, r.Method, r.RequestURI, r.Proto)
+
+	hijacker := w.(http.Hijacker)
+	clientConn, clientRW, err := hijacker.Hijack()
+	if err != nil {
+		req.logf("hijack error: %s", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
 	destConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		log.Print("%s: error serving %v to %v: ", err)
+		req.logf("dial error: %s", err)
 		writeError(r, clientConn, http.StatusBadGateway)
 		return
 	}
 
-	log.Printf("endpoint=%s remote=%v host=%s target=%s %s %s %s", hh.Proto, r.RemoteAddr, r.Host, target, r.Method, r.RequestURI, r.Proto)
-
-	if err = hh.writeHeaders(r, destConn); err != nil {
-		log.Print("%s: error writing header from %v to %v: %v", r.Proto, r.RemoteAddr, target, err)
+	if err = req.writeHeaders(r, destConn); err != nil {
+		req.logf("error writing headers: %s", err)
 		writeError(r, clientConn, http.StatusBadGateway)
 		return
 	}
 
-	go func() {
-		io.Copy(clientConn, destConn)
-		clientConn.Close()
-	}()
-	go func() {
-		io.Copy(destConn, clientConn)
-		destConn.Close()
-	}()
-}
-
-func (hh *HttpHandler) writeHeaders(r *http.Request, out io.Writer) (err error) {
-	if _, err = fmt.Fprintf(out, "%s %s %s\r\n", r.Method, r.URL.RequestURI(), r.Proto); err != nil {
-		return
-	}
-
-	headers := http.Header{}
-	headers.Add("Host", r.Host)
-
-	for name, values := range r.Header {
-		if name == "Forwarded" {
-			continue
-		}
-		if strings.HasPrefix(name, "X-Forwarded-") {
-			continue
-		}
-		for _, value := range values {
-			headers.Add(name, value)
-		}
-	}
-
-	// RFC7239: Forwarded HTTP Extension
-	// https://tools.ietf.org/html/rfc7239#section-5
-	headers.Add("X-Forwarded-For", r.RemoteAddr)
-	headers.Add("X-Forwarded-Host", r.Host)
-	headers.Add("X-Forwarded-Proto", hh.Proto)
-	headers.Add("Forwarded", fmt.Sprintf("for=%s, host=%s, proto=%s", r.RemoteAddr, r.Host, hh.Proto))
-
-	// end
-	if err = headers.Write(out); err != nil {
-		return
-	}
-	if _, err = out.Write([]byte{'\r', '\n'}); err != nil {
-		return
-	}
-	return
-}
-
-func writeHeader(name, value string, buf *bufio.Writer) (err error) {
-	if _, err = buf.WriteString(name + ": " + value + "\n"); err != nil {
-		return
-	}
-	return
+	go req.copy(&req.bytesOut, clientRW, destConn, clientConn)
+	go req.copy(&req.bytesIn, destConn, clientRW, destConn)
 }
 
 func writeError(r *http.Request, out io.WriteCloser, code int) {
 	text := http.StatusText(code)
-	fmt.Fprintf(out, "%s %d %s\n\n%s\n", r.Proto, code, text, text)
+	fmt.Fprintf(out, "%s %d %s\r\n\r\n%s\n", r.Proto, code, text, text)
 	out.Close()
 }
 
 // returns target and http status if no target is found
-func getBackend(r *http.Request) (string, int) {
+func getBackend(r *http.Request) (*config.Backend, string, int) {
 	backends := config.Current.HostBackends[r.Host]
 
-	backendWithoutTarget := false
 	for _, backend := range backends {
 		if !backend.HandlesPath(r.RequestURI) {
 			continue
@@ -146,16 +98,11 @@ func getBackend(r *http.Request) (string, int) {
 
 		target := backend.Target()
 		if target == "" {
-			backendWithoutTarget = true
-			continue
+			return nil, "", http.StatusServiceUnavailable
 		}
 
-		return target, 0
+		return backend, target, 0
 	}
 
-	if backendWithoutTarget {
-		return "", http.StatusServiceUnavailable
-	}
-
-	return "", http.StatusNotFound
+	return nil, "", http.StatusNotFound
 }
