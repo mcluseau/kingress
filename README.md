@@ -7,7 +7,7 @@ Reverse HTTP proxy dedicated to Kubernetes Ingress
 This is intended to be run in a Kubernetes cluster, like that:
 
 ```
-kubectl run kingress --image mcluseau/kingress:0.3.0
+kubectl run kingress --image mcluseau/kingress
 
 # expose HTTPS
 kubectl expose deploy kingress --name kingress-https --port 443 --external-ip=$ip
