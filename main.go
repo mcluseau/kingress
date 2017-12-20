@@ -44,6 +44,7 @@ func main() {
 
 	// HTTP to HTTPS
 	go func() {
+		log.Print("ssl-redirect: listening on ", *sslRedirBind)
 		err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
 		log.Fatal("ssl redirect handler finished: ", err)
 	}()

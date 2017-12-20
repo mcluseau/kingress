@@ -7,15 +7,21 @@ import (
 
 type BackendOptions struct {
 	SSLRedirect          bool
+	SecureBackends       bool
 	WhitelistSourceRange []*net.IPNet
 }
 
 func (o *BackendOptions) Set(key, value string) (known bool, err error) {
 	known = true
 
+	// Try to handle some of the nginx ingress controller options
+	// (see https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/annotations.md)
 	switch key {
 	case "ssl-redirect":
 		o.SSLRedirect = boolOpt(value)
+
+	case "secure-backends":
+		o.SecureBackends = boolOpt(value)
 
 	case "whitelist-source-range":
 		o.WhitelistSourceRange, err = ipNetArray(value)

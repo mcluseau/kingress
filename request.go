@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base32"
 	"fmt"
 	"io"
@@ -46,13 +47,19 @@ func (r *request) logf(pattern string, args ...interface{}) {
 	log.Printf("endpoints=%s req=%s time=%s time-ns=%d "+pattern, allArgs...)
 }
 
-func (r *request) dialTarget(target string) error {
-	c, err := net.DialTimeout("tcp", target, dialTimeout)
+func (r *request) dialTarget(target string, secure bool) (err error) {
+	var c interface{}
+
+	if secure {
+		c, err = tls.Dial("tcp", target, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		c, err = net.DialTimeout("tcp", target, dialTimeout)
+	}
 	if err != nil {
-		return err
+		return
 	}
 	r.target = c.(proxyDestination)
-	return nil
+	return
 }
 
 type proxyDestination interface {

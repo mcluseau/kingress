@@ -98,7 +98,7 @@ func (hh *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = req.dialTarget(target); err != nil {
+	if err = req.dialTarget(target, backend.Options.SecureBackends); err != nil {
 		req.logf("dial error: %s", err)
 		writeError(r, clientConn, http.StatusBadGateway)
 		return
