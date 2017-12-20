@@ -31,6 +31,7 @@ func getCertificate(helloInfo *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	certificate, ok := config.Current.HostCerts[helloInfo.ServerName]
 
 	if !ok {
+		log.Printf("https: using default certificate for %s", helloInfo.ServerName)
 		return config.Current.DefaultCert, nil
 	}
 
