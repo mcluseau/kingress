@@ -28,9 +28,9 @@ Usage of kingress:
   -change-apply-delay duration
     	Delay before applying change in Kubernetes configuration (default 100ms)
   -http string
-    	HTTP bind specification (default ":80")
+    	HTTP bind specification (empty to disable) (default ":80")
   -https string
-    	HTTPS bind specification (default ":443")
+    	HTTPS bind specification (empty to disable) (default ":443")
   -log_backtrace_at value
     	when logging hits line file:N, emit a stack trace
   -log_dir string
@@ -46,7 +46,7 @@ Usage of kingress:
   -selector string
     	Ingress selector
   -ssl-redirect string
-    	HTTP to HTTPS redirector bind specification (default ":81")
+    	HTTP to HTTPS redirector bind specification (empty to disable)
   -stderrthreshold value
     	logs at or above this threshold go to stderr
   -tls-secret string
