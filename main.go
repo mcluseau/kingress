@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	httpBind     = flag.String("http", ":80", "HTTP bind specification")
-	httpsBind    = flag.String("https", ":443", "HTTPS bind specification")
-	sslRedirBind = flag.String("ssl-redirect", ":81", "HTTP to HTTPS redirector bind specification")
+	httpBind     = flag.String("http", ":80", "HTTP bind specification (empty to disable)")
+	httpsBind    = flag.String("https", ":443", "HTTPS bind specification (empty to disable)")
+	sslRedirBind = flag.String("ssl-redirect", "", "HTTP to HTTPS redirector bind specification (empty to disable)")
 )
 
 func main() {
@@ -31,23 +31,29 @@ func main() {
 	k8s.Start()
 
 	// HTTP
-	go func() {
-		err := startHTTP(*httpBind)
-		log.Fatal("http handler finished: ", err)
-	}()
+	if len(*httpBind) != 0 {
+		go func() {
+			err := startHTTP(*httpBind)
+			log.Fatal("http handler finished: ", err)
+		}()
+	}
 
 	// HTTPS
-	go func() {
-		err := startHTTPS(*httpsBind)
-		log.Fatal("https handler finished: ", err)
-	}()
+	if len(*httpsBind) != 0 {
+		go func() {
+			err := startHTTPS(*httpsBind)
+			log.Fatal("https handler finished: ", err)
+		}()
+	}
 
 	// HTTP to HTTPS
-	go func() {
-		log.Print("ssl-redirect: listening on ", *sslRedirBind)
-		err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
-		log.Fatal("ssl redirect handler finished: ", err)
-	}()
+	if len(*sslRedirBind) != 0 {
+		go func() {
+			log.Print("ssl-redirect: listening on ", *sslRedirBind)
+			err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
+			log.Fatal("ssl redirect handler finished: ", err)
+		}()
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
