@@ -1,14 +1,16 @@
 package main
 
 import (
+	crand "crypto/rand"
 	"flag"
 	"log"
+	"math"
+	"math/big"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/mcluseau/kingress/k8s"
 )
@@ -25,9 +27,16 @@ func main() {
 
 	log.Print("Starting...")
 
-	// TODO init from crypto/rand
-	rand.Seed(time.Now().UnixNano())
+	// seed math/rand
+	{
+		v, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+		if err != nil {
+			log.Fatal("failed to read a random value: ", err)
+		}
+		rand.Seed(v.Int64())
+	}
 
+	// Start watching kubernetes
 	k8s.Start()
 
 	// HTTP
