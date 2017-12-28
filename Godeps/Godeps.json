@@ -2,6 +2,9 @@
 	"ImportPath": "github.com/mcluseau/kingress",
 	"GoVersion": "go1.9",
 	"GodepVersion": "v79",
+	"Packages": [
+		"."
+	],
 	"Deps": [
 		{
 			"ImportPath": "github.com/PuerkitoBio/purell",
@@ -107,6 +110,11 @@
 			"Rev": "0c5108395e2debce0d731cf0287ddf7242066aba"
 		},
 		{
+			"ImportPath": "github.com/gorilla/websocket",
+			"Comment": "v1.2.0-24-gd965e9a",
+			"Rev": "d965e9adc66deebadcc7d0c6c7598e2a4baa7838"
+		},
+		{
 			"ImportPath": "github.com/gregjones/httpcache",
 			"Rev": "787624de3eb7bd915c329cba748687a3b22666a6"
 		},
@@ -158,8 +166,21 @@
 			"Rev": "5f041e8faa004a95c88a202771f4cc3e991971e6"
 		},
 		{
+			"ImportPath": "github.com/sirupsen/logrus",
+			"Comment": "v1.0.4",
+			"Rev": "d682213848ed68c0a260ca37d6dd5ace8423f5ba"
+		},
+		{
 			"ImportPath": "github.com/spf13/pflag",
 			"Rev": "9ff6c6923cfffbcd502984b8e0c80539a94968b7"
+		},
+		{
+			"ImportPath": "github.com/vulcand/oxy/forward",
+			"Rev": "1e56086638c5503208afb0fe74b28d1b36eedf94"
+		},
+		{
+			"ImportPath": "github.com/vulcand/oxy/utils",
+			"Rev": "1e56086638c5503208afb0fe74b28d1b36eedf94"
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/ssh/terminal",

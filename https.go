@@ -20,7 +20,7 @@ func startHTTPS(bind string) error {
 
 	log.Print("https: listening on ", bind)
 
-	if err := http.Serve(listener, &HttpHandler{"https", portOfBind(bind)}); err != nil {
+	if err := http.Serve(listener, newHandler("https", portOfBind(bind))); err != nil {
 		log.Fatal("https: serve error: ", err)
 	}
 
@@ -32,6 +32,9 @@ func getCertificate(helloInfo *tls.ClientHelloInfo) (*tls.Certificate, error) {
 
 	if !ok {
 		log.Printf("https: using default certificate for %s", helloInfo.ServerName)
+		if config.Current.DefaultCert == nil {
+			log.Printf("https: warning: default certificate is not available")
+		}
 		return config.Current.DefaultCert, nil
 	}
 

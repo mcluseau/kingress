@@ -19,7 +19,7 @@ func startHTTP(bind string) error {
 
 	log.Print("http: listening on ", bind)
 
-	if err := http.Serve(listener, &HttpHandler{"http", portOfBind(bind)}); err != nil {
+	if err := http.Serve(listener, newHandler("http", portOfBind(bind))); err != nil {
 		log.Fatal("http: serve error: ", err)
 	}
 
