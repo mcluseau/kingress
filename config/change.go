@@ -45,7 +45,7 @@ func applyChange(myChangeNum uint64, callback NewConfigFunc) {
 			parts := strings.Split(be, ":")
 
 			if len(parts) != 3 {
-				log.Fatal("bad custom backend format: %s", be)
+				log.Fatal("bad custom backend format: ", be)
 			}
 
 			hostParts := strings.SplitN(parts[0], "/", 2)
