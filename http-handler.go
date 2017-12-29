@@ -21,8 +21,8 @@ func portOfBind(bind string) string {
 	return strconv.Itoa(addr.Port)
 }
 
-// Returns true iff the request can be forwarded to the backend
-func allowRequest(backend *config.Backend, handlerProto string, req *request, w http.ResponseWriter, r *http.Request) bool {
+// Returns "" iff the request can be forwarded to the backend, the reject reason otherwise
+func allowRequest(backend *config.Backend, handlerProto string, w http.ResponseWriter, r *http.Request) string {
 	// check for whitelist
 	if backend.Options.WhitelistSourceRange != nil {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -44,20 +44,18 @@ func allowRequest(backend *config.Backend, handlerProto string, req *request, w 
 		}
 
 		if !accessOk {
-			req.logf("rejecting (not in whitelist)")
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return false
+			return "rejecting (not in whitelist)"
 		}
 	}
 
 	// check for SSL redirection
 	if backend.Options.SSLRedirect && handlerProto == "http" {
-		req.logf("redirecting to HTTPS")
 		redirectToHTTPS(w, r)
-		return false
+		return "redirecting to HTTPS"
 	}
 
-	return true
+	return ""
 }
 
 // returns target and http status if no target is found

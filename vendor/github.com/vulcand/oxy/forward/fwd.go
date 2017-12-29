@@ -377,16 +377,9 @@ func (f *httpForwarder) copyWebSocketRequest(req *http.Request) (outReq *http.Re
 
 // serveHTTP forwards HTTP traffic using the configured transport
 func (f *httpForwarder) serveHTTP(w http.ResponseWriter, inReq *http.Request, ctx *handlerContext) {
-	if f.log.Level >= log.DebugLevel {
-		logEntry := f.log.WithField("Request", utils.DumpHttpRequest(inReq))
-		logEntry.Debug("vulcand/oxy/forward/http: begin ServeHttp on request")
-		defer logEntry.Debug("vulcand/oxy/forward/http: completed ServeHttp on request")
-	}
-
 	pw := &utils.ProxyWriter{
 		W: w,
 	}
-	start := time.Now().UTC()
 
 	outReq := new(http.Request)
 	*outReq = *inReq // includes shallow copies of maps, but we handle this in Director
@@ -400,18 +393,6 @@ func (f *httpForwarder) serveHTTP(w http.ResponseWriter, inReq *http.Request, ct
 		ModifyResponse: f.modifyResponse,
 	}
 	revproxy.ServeHTTP(pw, outReq)
-
-	if inReq.TLS != nil {
-		f.log.Infof("vulcand/oxy/forward/http: Round trip: %v, code: %v, Length: %v, duration: %v tls:version: %x, tls:resume:%t, tls:csuite:%x, tls:server:%v",
-			inReq.URL, pw.Code, pw.Length, time.Now().UTC().Sub(start),
-			inReq.TLS.Version,
-			inReq.TLS.DidResume,
-			inReq.TLS.CipherSuite,
-			inReq.TLS.ServerName)
-	} else {
-		f.log.Infof("vulcand/oxy/forward/http: Round trip: %v, code: %v, Length: %v, duration: %v",
-			inReq.URL, pw.Code, pw.Length, time.Now().UTC().Sub(start))
-	}
 }
 
 // isWebsocketRequest determines if the specified HTTP request is a

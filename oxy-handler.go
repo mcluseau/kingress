@@ -5,7 +5,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"runtime"
 	"time"
 
 	"github.com/vulcand/oxy/forward"
@@ -67,15 +66,6 @@ func (h *oxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	req := newRequest(h.Proto)
 
-	defer func() {
-		if err := recover(); err != nil {
-			const size = 64 << 10
-			buf := make([]byte, size)
-			buf = buf[:runtime.Stack(buf, false)]
-			req.logf("panic: %v\n%s", err, buf)
-		}
-	}()
-
 	backend, target, status := getBackend(r)
 	if status != 0 {
 		// no backend matching
@@ -83,10 +73,21 @@ func (h *oxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.logf("remote=%s host=%s ingress=%s target=%s method=%s uri=%q proto=%q",
-		r.RemoteAddr, r.Host, backend.IngressRef, target, r.Method, r.RequestURI, r.Proto)
+	startLog := &RequestStartLog{
+		Request: req,
+		Remote:  r.RemoteAddr,
+		Proto:   r.Proto,
+		Host:    r.Host,
+		Method:  r.Method,
+		URI:     r.RequestURI,
+		Ingress: backend.IngressRef,
+		Target:  target,
+		Reject:  allowRequest(backend, h.Proto, w, r),
+	}
 
-	if !allowRequest(backend, h.Proto, req, w, r) {
+	logCh <- startLog
+
+	if len(startLog.Reject) != 0 {
 		return
 	}
 
@@ -99,5 +100,8 @@ func (h *oxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.fwd.ServeHTTP(w, r)
 
-	req.logf("finished")
+	logCh <- &RequestEndLog{
+		Request: req,
+		Time:    req.Clock(),
+	}
 }

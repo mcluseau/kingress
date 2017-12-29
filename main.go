@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 
 	"github.com/mcluseau/kingress/k8s"
@@ -19,11 +20,23 @@ var (
 	httpBind     = flag.String("http", ":80", "HTTP bind specification (empty to disable)")
 	httpsBind    = flag.String("https", ":443", "HTTPS bind specification (empty to disable)")
 	sslRedirBind = flag.String("ssl-redirect", "", "HTTP to HTTPS redirector bind specification (empty to disable)")
+	cpuProf      = flag.String("pprof-cpu", "", "Enable CPU profiling to this file")
 )
 
 func main() {
 	flag.Set("logtostderr", "true")
 	flag.Parse()
+
+	if len(*cpuProf) != 0 {
+		f, err := os.Create(*cpuProf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	go processLog()
 
 	log.Print("Starting...")
 
@@ -71,5 +84,4 @@ func main() {
 	log.Printf("Got signal %s, exiting.", sig)
 
 	k8s.Stop()
-	os.Exit(0)
 }
