@@ -58,7 +58,7 @@ func applyChange(myChangeNum uint64, callback NewConfigFunc) {
 			target := parts[1] + ":" + parts[2]
 
 			config.HostBackends[host] = []*Backend{
-				NewBackend(fmt.Sprintf("custom[%d]", idx), path, target),
+				NewBackend(fmt.Sprintf("command-line[%d]", idx), path, target),
 			}
 		}
 	}
