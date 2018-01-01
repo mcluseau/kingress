@@ -53,6 +53,7 @@ func (l *RequestStartLog) ToLog(message *LogMessage) {
 	l.Request.ToLog(message)
 
 	message.
+		Field("start", l.Request.start).
 		Field("remote", l.Remote).
 		Field("proto", l.Proto).
 		Field("host", l.Host).

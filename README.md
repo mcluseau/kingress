@@ -16,6 +16,7 @@ kubectl expose deploy kingress --name kingress-https --port 443 --external-ip=$i
 kubectl expose deploy kingress --name kingress-http --port 80 --external-ip=$ip
 
 # expose HTTP (always redirecting to HTTPS)
+# you must add something like `-ssl-redirect=:81` to the container args
 kubectl expose deploy kingress --name kingress-http2https --port 80 --target-port 81 --external-ip=$ip
 ```
 
