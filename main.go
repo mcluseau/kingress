@@ -20,6 +20,7 @@ var (
 	httpBind     = flag.String("http", ":80", "HTTP bind specification (empty to disable)")
 	httpsBind    = flag.String("https", ":443", "HTTPS bind specification (empty to disable)")
 	sslRedirBind = flag.String("ssl-redirect", "", "HTTP to HTTPS redirector bind specification (empty to disable)")
+	apiBind      = flag.String("api", "127.0.0.1:2287", "API bind specication (empty to disable)")
 	cpuProf      = flag.String("pprof-cpu", "", "Enable CPU profiling to this file")
 )
 
@@ -74,6 +75,13 @@ func main() {
 			log.Print("ssl-redirect: listening on ", *sslRedirBind)
 			err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
 			log.Fatal("ssl redirect handler finished: ", err)
+		}()
+	}
+
+	if len(*apiBind) != 0 {
+		go func() {
+			err := startAPI(*apiBind)
+			log.Fatal("API handler finished: ", err)
 		}()
 	}
 
