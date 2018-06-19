@@ -1,4 +1,4 @@
-from golang:1.9.2-alpine3.7 as build-env
+from golang:1.10.2-alpine3.7 as build-env
 env pkg github.com/mcluseau/kingress
 add . ${GOPATH}/src/${pkg}
 run cd ${GOPATH}/src/${pkg} \
