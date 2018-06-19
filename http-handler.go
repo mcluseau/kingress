@@ -63,6 +63,13 @@ func getBackend(r *http.Request) (*config.Backend, string, int) {
 	hostWithoutPort := strings.Split(r.Host, ":")[0]
 	backends := config.Current.HostBackends[hostWithoutPort]
 
+	if backends == nil {
+		// maybe a wildcard handles it
+		if n := strings.Index(hostWithoutPort, "."); n > 0 {
+			backends = config.Current.HostBackends["*"+hostWithoutPort[n:]]
+		}
+	}
+
 	for _, backend := range backends {
 		if !backend.HandlesPath(r.RequestURI) {
 			continue
