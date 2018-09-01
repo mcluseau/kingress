@@ -1,4 +1,5 @@
 from golang:1.11.0-alpine3.8 as build-env
+run apk update && apk add gcc musl-dev
 env pkg github.com/mcluseau/kingress
 add . ${GOPATH}/src/${pkg}
 run cd ${GOPATH}/src/${pkg} \
