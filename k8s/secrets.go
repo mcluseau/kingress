@@ -23,8 +23,10 @@ func (h secretsHandler) OnAdd(obj interface{}) {
 	h.update(obj.(*core.Secret))
 }
 func (h secretsHandler) OnUpdate(oldObj, newObj interface{}) {
+	h.update(newObj.(*core.Secret))
 }
 func (h secretsHandler) OnDelete(obj interface{}) {
+	h.delete(obj.(*core.Secret))
 }
 
 func (h secretsHandler) update(secret *core.Secret) {
