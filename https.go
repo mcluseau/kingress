@@ -2,11 +2,20 @@ package main
 
 import (
 	"crypto/tls"
+	"flag"
 	"log"
 	"net/http"
 
 	"github.com/mcluseau/kingress/config"
 )
+
+var (
+	debugTLS = false
+)
+
+func init() {
+	flag.BoolVar(&debugTLS, "debug-tls", false, "activate TLS debug logs")
+}
 
 func startHTTPS(bind string) error {
 	config := &tls.Config{
@@ -31,7 +40,9 @@ func getCertificate(helloInfo *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	certificate, ok := config.Current.HostCerts[helloInfo.ServerName]
 
 	if !ok {
-		log.Printf("https: using default certificate for %s", helloInfo.ServerName)
+		if debugTLS {
+			log.Printf("https: using default certificate for %q", helloInfo.ServerName)
+		}
 		if config.Current.DefaultCert == nil {
 			log.Printf("https: warning: default certificate is not available")
 		}
