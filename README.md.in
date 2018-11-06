@@ -1,0 +1,42 @@
+# kingress
+
+Reverse HTTP proxy dedicated to Kubernetes Ingress
+
+## Usage
+
+This is intended to be run in a Kubernetes cluster, like that:
+
+```
+kubectl run kingress --image mcluseau/kingress
+
+# expose HTTPS
+kubectl expose deploy kingress --name kingress-https --port 443 --external-ip=$ip
+
+# expose HTTP (following ingress rules)
+kubectl expose deploy kingress --name kingress-http --port 80 --external-ip=$ip
+
+# expose HTTP (always redirecting to HTTPS)
+# you must add something like `-ssl-redirect=:81` to the container args
+kubectl expose deploy kingress --name kingress-http2https --port 80 --target-port 81 --external-ip=$ip
+```
+
+## Supported annotations
+
+This controller looks for annotations with the any of the following prefixes:
+
+- `ingress.kubernetes.io`
+- `nginx.ingress.kubernetes.io`
+
+The following annotations are supported:
+
+| Annotation | Description |
+| --- | --- |
+{{- range .annotations }}
+| `{{ .Name -}}` | {{ .Description }} |
+{{- end }}
+
+## Command line flags
+
+```
+{{ sh "kingress -h" }}
+```

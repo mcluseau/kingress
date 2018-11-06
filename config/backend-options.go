@@ -2,7 +2,7 @@ package config
 
 import (
 	"net"
-	"strings"
+	"sort"
 )
 
 type BackendOptions struct {
@@ -11,49 +11,17 @@ type BackendOptions struct {
 	WhitelistSourceRange []*net.IPNet
 }
 
-func (o *BackendOptions) Set(key, value string) (known bool, err error) {
-	known = true
+func (o *BackendOptions) Set(key, value string) (bool, error) {
+	// search by name in sorted annotations set
+	i := sort.Search(len(Annotations), func(i int) bool {
+		return Annotations[i].Name >= key
+	})
 
-	// Try to handle some of the nginx ingress controller options
-	// (see https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/annotations.md)
-	switch key {
-	case "ssl-redirect":
-		o.SSLRedirect = boolOpt(value)
-
-	case "secure-backends":
-		o.SecureBackends = boolOpt(value)
-
-	case "whitelist-source-range":
-		o.WhitelistSourceRange, err = ipNetArray(value)
-
-	default:
-		known = false
+	if i >= len(Annotations) || Annotations[i].Name != key {
+		return false, nil
 	}
 
-	return
-}
+	err := Annotations[i].apply(o, value)
 
-func boolOpt(value string) bool {
-	return value == "true"
-}
-
-func ipNetArray(value string) ([]*net.IPNet, error) {
-	if value == "" {
-		return nil, nil
-	}
-
-	values := strings.Split(value, ",")
-	nets := make([]*net.IPNet, len(values))
-
-	for i, v := range values {
-		_, ipnet, err := net.ParseCIDR(strings.TrimSpace(v))
-		if err != nil {
-			// on error, return an empty (fail safe to no allowed nets)
-			return []*net.IPNet{}, err
-		}
-
-		nets[i] = ipnet
-	}
-
-	return nets, nil
+	return true, err
 }

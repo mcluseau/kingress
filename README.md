@@ -20,18 +20,42 @@ kubectl expose deploy kingress --name kingress-http --port 80 --external-ip=$ip
 kubectl expose deploy kingress --name kingress-http2https --port 80 --target-port 81 --external-ip=$ip
 ```
 
-In standalone mode:
+## Supported annotations
+
+This controller looks for annotations with the any of the following prefixes:
+
+- `ingress.kubernetes.io`
+- `nginx.ingress.kubernetes.io`
+
+The following annotations are supported:
+
+| Annotation | Description |
+| --- | --- |
+| `secure-backends` | Make TLS connections to the upstream instead of plain HTTP. Initialy from ingress-nginx but removed from it, we still support it. |
+| `ssl-redirect` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#server-side-https-enforcement-through-redirect) |
+| `whitelist-source-range` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#whitelist-source-range) |
+
+## Command line flags
 
 ```
+$ kingress -h
 Usage of kingress:
   -alsologtostderr
     	log to standard error as well as files
+  -api string
+    	API bind specication (empty to disable) (default "127.0.0.1:2287")
   -change-apply-delay duration
     	Delay before applying change in Kubernetes configuration (default 100ms)
+  -custom string
+    	Custom backend definitions (format: "<host><path>:<target IP>:<target port>,...")
+  -debug-tls
+    	activate TLS debug logs
   -http string
     	HTTP bind specification (empty to disable) (default ":80")
   -https string
     	HTTPS bind specification (empty to disable) (default ":443")
+  -httptest.serve string
+    	if non-empty, httptest.NewServer serves on this address and blocks
   -log_backtrace_at value
     	when logging hits line file:N, emit a stack trace
   -log_dir string
@@ -42,6 +66,8 @@ Usage of kingress:
     	The address of the Kubernetes API server
   -namespace string
     	Namespace (defaults to all)
+  -pprof-cpu string
+    	Enable CPU profiling to this file
   -resync-period duration
     	Period between full resyncs with Kubernetes (default 10m0s)
   -selector string
@@ -56,4 +82,5 @@ Usage of kingress:
     	log level for V logs
   -vmodule value
     	comma-separated list of pattern=N settings for file-filtered logging
+
 ```
