@@ -28,7 +28,8 @@ func newConfig() config.Config {
 			// lookup the target port for the ingress' target service/port
 			targetPort, ok := findTargetPort(rule.Service, rule.Port)
 			if !ok {
-				log.Printf("warning: no target for service %s, port %s (ingress: %s)", rule.Service, rule.Port.String(), ingRef)
+				// we may log here but this kind of problem is visible in the endpoints
+				// log.Printf("no target for service %s, port %s (ingress: %s)", rule.Service, rule.Port.String(), ingRef)
 				continue
 			}
 
