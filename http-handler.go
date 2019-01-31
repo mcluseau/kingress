@@ -50,7 +50,7 @@ func allowRequest(backend *config.Backend, handlerProto string, w http.ResponseW
 	}
 
 	// check for SSL redirection
-	if backend.Options.SSLRedirect && handlerProto == "http" {
+	if backend.Options.SSLRedirect && handlerProto != "https" {
 		redirectToHTTPS(w, r)
 		return "redirecting to HTTPS"
 	}
