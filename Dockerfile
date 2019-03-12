@@ -1,12 +1,23 @@
-from golang:1.11.5-alpine3.8 as build-env
-run apk update && apk add gcc musl-dev
-env pkg github.com/mcluseau/kingress
-add . ${GOPATH}/src/${pkg}
-run cd ${GOPATH}/src/${pkg} \
- && go vet  ./... \
- && go test ./... \
- && go install
+from golang:1.12.0-alpine3.9 as build-env
+arg GOPROXY
+env CGO_ENABLED 0
+
+workdir /src
+add go.mod go.sum ./
+run go mod download
+
+add . ./
+run go test ./...
+run go install
+
+#run apk update && apk add gcc musl-dev
+#env pkg github.com/mcluseau/kingress
+#add . ${GOPATH}/src/${pkg}
+#run cd ${GOPATH}/src/${pkg} \
+# && go vet  ./... \
+# && go test ./... \
+# && go install
 
 from alpine:3.8
-entrypoint ["/kingress"]
-copy --from=build-env /go/bin/kingress /
+entrypoint ["/bin/kingress"]
+copy --from=build-env /go/bin/* /bin/
