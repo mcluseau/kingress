@@ -1,4 +1,5 @@
 from golang:1.12.0-alpine3.9 as build-env
+run apk add --update git
 arg GOPROXY
 env CGO_ENABLED 0
 
