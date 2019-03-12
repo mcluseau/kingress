@@ -18,6 +18,6 @@ run go install
 # && go test ./... \
 # && go install
 
-from alpine:3.8
+from alpine:3.9
 entrypoint ["/bin/kingress"]
 copy --from=build-env /go/bin/* /bin/
