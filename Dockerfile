@@ -1,4 +1,4 @@
-from golang:1.12.0-alpine3.9 as build-env
+from golang:1.13.0-alpine3.10 as build-env
 run apk add --update git
 arg GOPROXY
 env CGO_ENABLED 0
@@ -11,14 +11,6 @@ add . ./
 run go test ./...
 run go install
 
-#run apk update && apk add gcc musl-dev
-#env pkg github.com/mcluseau/kingress
-#add . ${GOPATH}/src/${pkg}
-#run cd ${GOPATH}/src/${pkg} \
-# && go vet  ./... \
-# && go test ./... \
-# && go install
-
-from alpine:3.9
+from alpine:3.10
 entrypoint ["/bin/kingress"]
 copy --from=build-env /go/bin/* /bin/
