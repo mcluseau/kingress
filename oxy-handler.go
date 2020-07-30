@@ -28,6 +28,7 @@ func newOxyHandler(proto, port string) http.Handler {
 		forward.RoundTripper(roundTripper()),
 		forward.WebsocketTLSClientConfig(tlsConfig),
 		forward.Stream(true),
+		forward.StreamingFlushInterval(-1),
 	)
 	if err != nil {
 		panic(err) // what can it be?
