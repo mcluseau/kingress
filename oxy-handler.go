@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"flag"
 	"log"
 	"net"
 	"net/http"
@@ -14,6 +15,11 @@ var (
 	tlsConfig = &tls.Config{
 		InsecureSkipVerify: true,
 	}
+
+	flushInterval = flag.Duration("flush-interval", 10*time.Millisecond, `forward flush interval.
+If zero, no periodic flushing is done.
+A negative value (ie: -1ns) means to flush immediately.
+Ignored when a response is recognized as a streaming response; for such reponses, writes are flushed immediately.`)
 )
 
 type oxyHandler struct {
@@ -28,7 +34,7 @@ func newOxyHandler(proto, port string) http.Handler {
 		forward.RoundTripper(roundTripper()),
 		forward.WebsocketTLSClientConfig(tlsConfig),
 		forward.Stream(true),
-		forward.StreamingFlushInterval(-1),
+		forward.StreamingFlushInterval(*flushInterval),
 	)
 	if err != nil {
 		panic(err) // what can it be?
