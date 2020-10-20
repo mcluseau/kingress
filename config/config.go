@@ -10,6 +10,7 @@ type Backends map[string][]*Backend
 type Certificates map[string]*tls.Certificate
 
 type Config struct {
+	Errors       []string
 	HostBackends Backends
 	HostCerts    Certificates
 	DefaultCert  *tls.Certificate

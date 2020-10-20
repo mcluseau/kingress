@@ -26,9 +26,6 @@ func Client() *kubernetes.Clientset {
 }
 
 func connect() {
-	// Use in-cluster config or provide options
-	var err error
-
 	if *kubeconfig == "" {
 		*kubeconfig = os.Getenv("KUBECONFIG")
 	}

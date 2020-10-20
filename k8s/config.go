@@ -2,7 +2,7 @@ package k8s
 
 import (
 	"crypto/tls"
-	"log"
+	"fmt"
 	"sort"
 
 	"github.com/mcluseau/kingress/config"
@@ -10,6 +10,7 @@ import (
 
 func newConfig() config.Config {
 	newBackends := config.Backends{}
+	errors := make([]string, 0)
 
 	for ingRef, rules := range ingressRules {
 	rulesLoop:
@@ -18,9 +19,9 @@ func newConfig() config.Config {
 
 			for _, backend := range backends {
 				if backend.Prefix == rule.Path {
-					log.Printf("warning: duplicate definition for host %s, path %v: "+
-						"ignoring ingress %s rule to %s:%s",
-						rule.Host, rule.Path, ingRef, rule.Service, rule.Port.String())
+					errors = append(errors, fmt.Sprintf(
+						"warning: duplicate definition for host %s, path %v: ignoring ingress %s rule to %s:%s",
+						rule.Host, rule.Path, ingRef, rule.Service, rule.Port.String()))
 					continue rulesLoop
 				}
 			}
@@ -54,7 +55,9 @@ func newConfig() config.Config {
 		for _, ingTLS := range ingTLSs {
 			cert, ok := secretCertificate[ingTLS.SecretRef]
 			if !ok {
-				log.Printf("warning: no TLS secret %s for host %s (ingress: %s)", ingTLS.SecretRef, ingTLS.Host, ingRef)
+				errors = append(errors, fmt.Sprintf(
+					"warning: no TLS secret %s for host %s (ingress: %s)",
+					ingTLS.SecretRef, ingTLS.Host, ingRef))
 				continue
 			}
 
@@ -62,7 +65,10 @@ func newConfig() config.Config {
 		}
 	}
 
+	sort.Strings(errors)
+
 	return config.Config{
+		Errors:       errors,
 		HostBackends: newBackends,
 		HostCerts:    newCerts,
 		DefaultCert:  defaultCert,

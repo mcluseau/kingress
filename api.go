@@ -57,6 +57,7 @@ func writeConfig(w http.ResponseWriter) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"errors":              cfg.Errors,
 		"backends":            cfg.HostBackends,
 		"default-certificate": newCertInfo(cfg.DefaultCert),
 		"certificates":        certs,
@@ -112,6 +113,12 @@ var statusTemplate = template.Must(template.New("status").
 			return "success"
 		},
 	}).Parse(`
+{{ if .Errors }}
+<h2>Errors</h2>
+{{ range .Errors }}
+<div class="alert alert-danger">{{.}}</div>
+{{ end }}
+{{ end }}
 <h2>Certificates</h2>
 <table class="table">
 <thead><tr>
@@ -183,6 +190,7 @@ func writeStatus(w http.ResponseWriter) {
 	}
 
 	err := statusTemplate.Execute(w, map[string]interface{}{
+		"Errors":             cfg.Errors,
 		"Backends":           cfg.HostBackends,
 		"DefaultCertificate": newCertInfo(cfg.DefaultCert),
 		"Certificates":       certs,
