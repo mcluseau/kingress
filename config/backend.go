@@ -7,8 +7,8 @@ import (
 
 type Backend struct {
 	IngressRef string
-	prefix     string
-	targets    []string
+	Prefix     string
+	Targets    []string
 
 	Options BackendOptions
 }
@@ -16,25 +16,21 @@ type Backend struct {
 func NewBackend(ingressRef, prefix string, targets ...string) *Backend {
 	return &Backend{
 		IngressRef: ingressRef,
-		prefix:     prefix,
-		targets:    targets,
+		Prefix:     prefix,
+		Targets:    targets,
 	}
-}
-
-func (b *Backend) Prefix() string {
-	return b.prefix
 }
 
 func (b *Backend) HandlesPath(path string) bool {
-	return strings.HasPrefix(path, b.prefix)
+	return strings.HasPrefix(path, b.Prefix)
 }
 
 func (b *Backend) Target() string {
-	if len(b.targets) == 0 {
+	if len(b.Targets) == 0 {
 		return ""
 	}
 
-	target := b.targets[rand.Intn(len(b.targets))]
+	target := b.Targets[rand.Intn(len(b.Targets))]
 
 	return target
 }

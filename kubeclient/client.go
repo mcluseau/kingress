@@ -16,7 +16,8 @@ var (
 	k      *kubernetes.Clientset
 	config *restclient.Config
 
-	hostFlag = flag.String("master", "", "The address of the Kubernetes API server")
+	masterURL  = flag.String("master", "", "The address of the Kubernetes API server")
+	kubeconfig = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster. Defaults to envvar KUBECONFIG.")
 )
 
 func Client() *kubernetes.Clientset {
@@ -27,23 +28,21 @@ func Client() *kubernetes.Clientset {
 func connect() {
 	// Use in-cluster config or provide options
 	var err error
-	config, err = restclient.InClusterConfig()
-	if err != nil {
-		// TODO check the Kubernetes project's standards (default flags somewhere?)
-		config, err = clientcmd.BuildConfigFromFlags("", os.Getenv("HOME")+"/.kube/config")
-		if err = restclient.SetKubernetesDefaults(config); err != nil {
-			panic(err)
-		}
+
+	if *kubeconfig == "" {
+		*kubeconfig = os.Getenv("KUBECONFIG")
 	}
 
-	if *hostFlag != "" {
-		config.Host = *hostFlag
+	cfg, err := clientcmd.BuildConfigFromFlags(*masterURL, *kubeconfig)
+	if err != nil {
+		log.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
 
-	c, err := kubernetes.NewForConfig(config)
+	c, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Error building kubernetes client: %s", err.Error())
 	}
+
 	k = c
-	log.Print("kubernetes: connected to ", config.Host)
+	log.Print("kubernetes: connected to ", cfg.Host)
 }

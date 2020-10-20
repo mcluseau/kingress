@@ -16,6 +16,7 @@ var Annotations = []Annotation{
 	{
 		Name:        "ssl-redirect",
 		Description: fromNginx + "#server-side-https-enforcement-through-redirect)",
+		get:         func(o *BackendOptions) interface{} { return o.SSLRedirect },
 		apply: func(o *BackendOptions, value string) error {
 			o.SSLRedirect = boolOpt(value)
 			return nil
@@ -24,6 +25,7 @@ var Annotations = []Annotation{
 	{
 		Name:        "secure-backends",
 		Description: "Make TLS connections to the upstream instead of plain HTTP. Initialy from ingress-nginx but removed from it, we still support it.",
+		get:         func(o *BackendOptions) interface{} { return o.SecureBackends },
 		apply: func(o *BackendOptions, value string) error {
 			o.SecureBackends = boolOpt(value)
 			return nil
@@ -32,6 +34,7 @@ var Annotations = []Annotation{
 	{
 		Name:        "whitelist-source-range",
 		Description: fromNginx + "#whitelist-source-range)",
+		get:         func(o *BackendOptions) interface{} { return o.WhitelistSourceRange },
 		apply: func(o *BackendOptions, value string) (err error) {
 			o.WhitelistSourceRange, err = ipNetArray(value)
 			return
@@ -43,6 +46,7 @@ type Annotation struct {
 	Name        string
 	Description string
 	apply       func(o *BackendOptions, value string) error
+	get         func(o *BackendOptions) interface{}
 }
 
 type byName []Annotation

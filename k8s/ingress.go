@@ -93,6 +93,10 @@ func (_ ingressHandler) update(ing *ext.Ingress) {
 	// Collect host->secret associations
 	secrets := make([]ingressTLS, 0)
 	for _, tls := range ing.Spec.TLS {
+		if tls.SecretName == "" {
+			continue
+		}
+
 		secretRef := ing.Namespace + "/" + tls.SecretName
 
 		for _, host := range tls.Hosts {

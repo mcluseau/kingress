@@ -17,7 +17,7 @@ func newConfig() config.Config {
 			backends := newBackends[rule.Host]
 
 			for _, backend := range backends {
-				if backend.Prefix() == rule.Path {
+				if backend.Prefix == rule.Path {
 					log.Printf("warning: duplicate definition for host %s, path %v: "+
 						"ignoring ingress %s rule to %s:%s",
 						rule.Host, rule.Path, ingRef, rule.Service, rule.Port.String())
