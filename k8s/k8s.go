@@ -8,7 +8,7 @@ import (
 
 	"github.com/mcluseau/kingress/kubeclient"
 	corev1 "k8s.io/api/core/v1"
-	extv1b1 "k8s.io/api/extensions/v1beta1"
+	netv1 "k8s.io/api/networking/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,13 +25,13 @@ var (
 	resyncPeriod = flag.Duration("resync-period", 10*time.Minute, "Period between full resyncs with Kubernetes")
 )
 
-func Start() {
+func Start(hosts []string) {
 	stopCh = make(chan struct{}, 1)
 
 	c := kubeclient.Client()
 
 	// watch ingresses
-	watchK8s(c.ExtensionsV1beta1().RESTClient(), "ingresses", *selector, &extv1b1.Ingress{}, ingressHandler{})
+	watchK8s(c.NetworkingV1beta1().RESTClient(), "ingresses", *selector, &netv1.Ingress{}, ingressHandler{c, hosts})
 
 	// watch services & endpoints
 	watchK8s(c.CoreV1().RESTClient(), "services", "", &corev1.Service{}, servicesHandler{})

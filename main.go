@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,11 +51,23 @@ func main() {
 		rand.Seed(v.Int64())
 	}
 
-	// Start watching kubernetes
-	k8s.Start()
+	hosts := make([]string, 0, 2)
+	addIPs := func(bind string) {
+		h, _, err := net.SplitHostPort(bind)
+		if err != nil {
+			log.Fatal("bad bind spec: ", bind, ": ", err)
+		}
+
+		if h == "" {
+			h = "default"
+		}
+
+		hosts = append(hosts, h)
+	}
 
 	// HTTP
 	if len(*httpBind) != 0 {
+		addIPs(*httpBind)
 		go func() {
 			err := startHTTP(*httpBind)
 			log.Fatal("http handler finished: ", err)
@@ -63,6 +76,7 @@ func main() {
 
 	// HTTPS
 	if len(*httpsBind) != 0 {
+		addIPs(*httpsBind)
 		go func() {
 			err := startHTTPS(*httpsBind)
 			log.Fatal("https handler finished: ", err)
@@ -71,6 +85,7 @@ func main() {
 
 	// HTTP to HTTPS
 	if len(*sslRedirBind) != 0 {
+		addIPs(*sslRedirBind)
 		go func() {
 			log.Print("ssl-redirect: listening on ", *sslRedirBind)
 			err := http.ListenAndServe(*sslRedirBind, sslRedirectHandler{})
@@ -84,6 +99,9 @@ func main() {
 			log.Fatal("API handler finished: ", err)
 		}()
 	}
+
+	// Start watching kubernetes
+	k8s.Start(hosts)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
