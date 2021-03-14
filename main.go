@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"strings"
 	"syscall"
 
 	"github.com/mcluseau/kingress/k8s"
@@ -23,6 +24,7 @@ var (
 	sslRedirBind = flag.String("ssl-redirect", "", "HTTP to HTTPS redirector bind specification (empty to disable)")
 	apiBind      = flag.String("api", "127.0.0.1:2287", "API bind specication (empty to disable)")
 	cpuProf      = flag.String("pprof-cpu", "", "Enable CPU profiling to this file")
+	lbHosts      = flag.String("lb-hosts", "default", "Load balancer hosts to write in ingress statuses")
 )
 
 func main() {
@@ -101,7 +103,7 @@ func main() {
 	}
 
 	// Start watching kubernetes
-	k8s.Start(hosts)
+	k8s.Start(strings.Split(*lbHosts, ","), hosts)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)

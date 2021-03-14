@@ -25,13 +25,17 @@ var (
 	resyncPeriod = flag.Duration("resync-period", 10*time.Minute, "Period between full resyncs with Kubernetes")
 )
 
-func Start(hosts []string) {
+func Start(lbhosts, hosts []string) {
 	stopCh = make(chan struct{}, 1)
 
 	c := kubeclient.Client()
 
 	// watch ingresses
-	watchK8s(c.NetworkingV1().RESTClient(), "ingresses", *selector, &netv1.Ingress{}, ingressHandler{c, hosts})
+	watchK8s(c.NetworkingV1().RESTClient(), "ingresses", *selector, &netv1.Ingress{}, ingressHandler{
+		k8s:     c,
+		LBHosts: lbhosts,
+		Hosts:   hosts,
+	})
 
 	// watch services & endpoints
 	watchK8s(c.CoreV1().RESTClient(), "services", "", &corev1.Service{}, servicesHandler{})

@@ -37,8 +37,9 @@ type ingressTLS struct {
 }
 
 type ingressHandler struct {
-	k8s   *kubernetes.Clientset
-	Hosts []string
+	k8s     *kubernetes.Clientset
+	LBHosts []string
+	Hosts   []string
 }
 
 func (h ingressHandler) OnAdd(obj interface{}) {
@@ -141,7 +142,7 @@ func (h ingressHandler) update(ing *netv1.Ingress) {
 	// also check & update the status as needed
 	lb := v1.LoadBalancerStatus{}
 
-	for _, host := range h.Hosts {
+	for _, host := range h.LBHosts {
 		lbi := v1.LoadBalancerIngress{}
 
 		if net.ParseIP(host) != nil {
