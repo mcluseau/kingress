@@ -8,7 +8,7 @@ import (
 
 	"github.com/mcluseau/kingress/kubeclient"
 	corev1 "k8s.io/api/core/v1"
-	netv1 "k8s.io/api/networking/v1beta1"
+	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,7 +31,7 @@ func Start(hosts []string) {
 	c := kubeclient.Client()
 
 	// watch ingresses
-	watchK8s(c.NetworkingV1beta1().RESTClient(), "ingresses", *selector, &netv1.Ingress{}, ingressHandler{c, hosts})
+	watchK8s(c.NetworkingV1().RESTClient(), "ingresses", *selector, &netv1.Ingress{}, ingressHandler{c, hosts})
 
 	// watch services & endpoints
 	watchK8s(c.CoreV1().RESTClient(), "services", "", &corev1.Service{}, servicesHandler{})

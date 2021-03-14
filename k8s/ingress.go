@@ -10,7 +10,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	netv1 "k8s.io/api/networking/v1beta1"
+	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -91,11 +91,23 @@ func (h ingressHandler) update(ing *netv1.Ingress) {
 	// Collect host,path->target associations
 	for _, rule := range ing.Spec.Rules {
 		for _, path := range rule.HTTP.Paths {
+			svc := path.Backend.Service
+
+			port := intstr.IntOrString{
+				Type:   intstr.Int,
+				IntVal: svc.Port.Number,
+			}
+
+			if svc.Port.Number == 0 {
+				port.Type = intstr.String
+				port.StrVal = svc.Port.Name
+			}
+
 			rules = append(rules, ingressRule{
 				Host:    rule.Host,
 				Path:    path.Path,
-				Service: ing.Namespace + "/" + path.Backend.ServiceName,
-				Port:    path.Backend.ServicePort,
+				Service: ing.Namespace + "/" + svc.Name,
+				Port:    port,
 				Options: opts,
 			})
 		}
@@ -145,7 +157,7 @@ func (h ingressHandler) update(ing *netv1.Ingress) {
 	newBytes, _ := json.Marshal(lb.Ingress)
 	if !bytes.Equal(curBytes, newBytes) {
 		log.Print("updating ingress status: ", ing.Namespace, "/", ing.Name, ": ", string(newBytes))
-		ingClient := h.k8s.NetworkingV1beta1().Ingresses(ing.Namespace)
+		ingClient := h.k8s.NetworkingV1().Ingresses(ing.Namespace)
 
 		ing.Status.LoadBalancer.Ingress = lb.Ingress
 
