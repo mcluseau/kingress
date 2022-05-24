@@ -1,5 +1,7 @@
 module github.com/mcluseau/kingress
 
+go 1.18
+
 require (
 	github.com/googleapis/gnostic v0.5.1 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
@@ -13,7 +15,5 @@ require (
 	k8s.io/apimachinery v0.20.1
 	k8s.io/client-go v1.5.1
 )
-
-go 1.14
 
 replace k8s.io/client-go => k8s.io/client-go v0.20.1
