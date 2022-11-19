@@ -6,9 +6,19 @@ import (
 )
 
 type BackendOptions struct {
-	SSLRedirect          bool
-	SecureBackends       bool
+	SSLRedirect    bool
+	SecureBackends bool
+
 	WhitelistSourceRange []*net.IPNet
+
+	CORS CORSOptions
+
+	GRPC    bool
+	GRPCWeb bool
+}
+
+type CORSOptions struct {
+	AllowedOrigins []string
 }
 
 func (o *BackendOptions) Set(key, value string) (bool, error) {

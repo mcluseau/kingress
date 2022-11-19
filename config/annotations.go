@@ -16,7 +16,7 @@ var Annotations = []Annotation{
 	{
 		Name:        "ssl-redirect",
 		Description: fromNginx + "#server-side-https-enforcement-through-redirect)",
-		get:         func(o *BackendOptions) interface{} { return o.SSLRedirect },
+		get:         func(o *BackendOptions) any { return o.SSLRedirect },
 		apply: func(o *BackendOptions, value string) error {
 			o.SSLRedirect = boolOpt(value)
 			return nil
@@ -25,7 +25,7 @@ var Annotations = []Annotation{
 	{
 		Name:        "secure-backends",
 		Description: "Make TLS connections to the upstream instead of plain HTTP. Initialy from ingress-nginx but removed from it, we still support it.",
-		get:         func(o *BackendOptions) interface{} { return o.SecureBackends },
+		get:         func(o *BackendOptions) any { return o.SecureBackends },
 		apply: func(o *BackendOptions, value string) error {
 			o.SecureBackends = boolOpt(value)
 			return nil
@@ -34,10 +34,37 @@ var Annotations = []Annotation{
 	{
 		Name:        "whitelist-source-range",
 		Description: fromNginx + "#whitelist-source-range)",
-		get:         func(o *BackendOptions) interface{} { return o.WhitelistSourceRange },
+		get:         func(o *BackendOptions) any { return o.WhitelistSourceRange },
 		apply: func(o *BackendOptions, value string) (err error) {
 			o.WhitelistSourceRange, err = ipNetArray(value)
 			return
+		},
+	},
+	{
+		Name:        "cors-allowed-origins",
+		Description: "comma separated list of CORS allowed origins. The special value '*' allows any origin.",
+		get:         func(o *BackendOptions) any { return o.CORS.AllowedOrigins },
+		apply: func(o *BackendOptions, value string) (err error) {
+			o.CORS.AllowedOrigins = strings.Split(value, ",")
+			return
+		},
+	},
+	{
+		Name:        "grpc",
+		Description: "handle gRPC requests",
+		get:         func(o *BackendOptions) any { return o.GRPC },
+		apply: func(o *BackendOptions, value string) error {
+			o.GRPC = boolOpt(value)
+			return nil
+		},
+	},
+	{
+		Name:        "grpc-web",
+		Description: "handle grpc-web requests",
+		get:         func(o *BackendOptions) any { return o.GRPCWeb },
+		apply: func(o *BackendOptions, value string) error {
+			o.GRPCWeb = boolOpt(value)
+			return nil
 		},
 	},
 }
@@ -46,7 +73,7 @@ type Annotation struct {
 	Name        string
 	Description string
 	apply       func(o *BackendOptions, value string) error
-	get         func(o *BackendOptions) interface{}
+	get         func(o *BackendOptions) any
 }
 
 type byName []Annotation

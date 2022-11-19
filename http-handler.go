@@ -10,8 +10,6 @@ import (
 	"github.com/mcluseau/kingress/config"
 )
 
-var newHandler func(proto, port string) http.Handler = newOxyHandler
-
 func portOfBind(bind string) string {
 	addr, err := net.ResolveTCPAddr("tcp", bind)
 	if err != nil {
@@ -61,6 +59,14 @@ func allowRequest(backend *config.Backend, handlerProto string, w http.ResponseW
 // returns target and http status if no target is found
 func getBackend(r *http.Request) (*config.Backend, string, int) {
 	hostWithoutPort := strings.Split(r.Host, ":")[0]
+
+	if hostWithoutPort == "" {
+		if r.TLS != nil {
+			hostWithoutPort = r.TLS.ServerName
+		}
+	}
+
+	// log.Print("host: ", hostWithoutPort)
 	backends := config.Current.HostBackends[hostWithoutPort]
 
 	if backends == nil {
@@ -71,7 +77,10 @@ func getBackend(r *http.Request) (*config.Backend, string, int) {
 	}
 
 	for _, backend := range backends {
-		if !backend.HandlesPath(r.RequestURI) {
+		// log.Print("- backend: ", backend)
+
+		if r.RequestURI != "*" /* for gRPC FIXME should check if it's gRPC */ && !backend.HandlesPath(r.RequestURI) {
+			// log.Print("  - does not handle the path: ", r.RequestURI)
 			continue
 		}
 

@@ -31,6 +31,9 @@ The following annotations are supported:
 
 | Annotation | Description |
 | --- | --- |
+| `cors-allowed-origins` | comma separated list of CORS allowed origins. The special value '*' allows any origin. |
+| `grpc` | handle gRPC requests |
+| `grpc-web` | handle grpc-web requests |
 | `secure-backends` | Make TLS connections to the upstream instead of plain HTTP. Initialy from ingress-nginx but removed from it, we still support it. |
 | `ssl-redirect` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#server-side-https-enforcement-through-redirect) |
 | `whitelist-source-range` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#whitelist-source-range) |
@@ -38,10 +41,8 @@ The following annotations are supported:
 ## Command line flags
 
 ```
-$ kingress -h
-Usage of kingress:
-  -alsologtostderr
-    	log to standard error as well as files
+$ ./kingress -h
+Usage of ./kingress:
   -api string
     	API bind specication (empty to disable) (default "127.0.0.1:2287")
   -change-apply-delay duration
@@ -50,18 +51,19 @@ Usage of kingress:
     	Custom backend definitions (format: "<host><path>:<target IP>:<target port>,...")
   -debug-tls
     	activate TLS debug logs
+  -flush-interval duration
+    	forward flush interval.
+    	If zero, no periodic flushing is done.
+    	A negative value (ie: -1ns) means to flush immediately.
+    	Ignored when a response is recognized as a streaming response; for such reponses, writes are flushed immediately. (default 10ms)
   -http string
     	HTTP bind specification (empty to disable) (default ":80")
   -https string
     	HTTPS bind specification (empty to disable) (default ":443")
-  -httptest.serve string
-    	if non-empty, httptest.NewServer serves on this address and blocks
-  -log_backtrace_at value
-    	when logging hits line file:N, emit a stack trace
-  -log_dir string
-    	If non-empty, write log files in this directory
-  -logtostderr
-    	log to standard error instead of files
+  -kubeconfig string
+    	Path to a kubeconfig. Only required if out-of-cluster. Defaults to envvar KUBECONFIG.
+  -lb-hosts string
+    	Load balancer hosts to write in ingress statuses (default "default")
   -master string
     	The address of the Kubernetes API server
   -namespace string
@@ -74,13 +76,7 @@ Usage of kingress:
     	Ingress selector
   -ssl-redirect string
     	HTTP to HTTPS redirector bind specification (empty to disable)
-  -stderrthreshold value
-    	logs at or above this threshold go to stderr
   -tls-secret string
     	Default TLS secret (format: namespace/name) (default "default/kingress-default")
-  -v value
-    	log level for V logs
-  -vmodule value
-    	comma-separated list of pattern=N settings for file-filtered logging
 
 ```
