@@ -1,12 +1,8 @@
 package main
 
 import (
-	crand "crypto/rand"
 	"flag"
 	"log"
-	"math"
-	"math/big"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -43,15 +39,6 @@ func main() {
 	go processLog()
 
 	log.Print("Starting...")
-
-	// seed math/rand
-	{
-		v, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
-		if err != nil {
-			log.Fatal("failed to read a random value: ", err)
-		}
-		rand.Seed(v.Int64())
-	}
 
 	hosts := make([]string, 0, 2)
 	addIPs := func(bind string) {

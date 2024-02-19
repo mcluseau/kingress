@@ -1,0 +1,6 @@
+curl -k -i -sv \
+    -H "Origin: http://${2:-fake.domain.com}" \
+    -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: X-Requested-With" \
+    -X OPTIONS \
+    --connect-to "::127.0.0.1:9881" \
+    "https://$1"

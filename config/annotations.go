@@ -40,6 +40,23 @@ var Annotations = []Annotation{
 			return
 		},
 	},
+	{
+		Name:        "cors-allowed-origins",
+		Description: "",
+		get:         func(o *BackendOptions) any { return o.CORSAllowedOrigins },
+		apply: func(o *BackendOptions, value string) (err error) {
+			value = strings.TrimSpace(value)
+			if len(value) == 0 {
+				return
+			}
+			origins := strings.Split(value, ",")
+			for i, o := range origins {
+				origins[i] = strings.TrimSpace(o)
+			}
+			o.CORSAllowedOrigins = origins
+			return
+		},
+	},
 }
 
 type Annotation struct {

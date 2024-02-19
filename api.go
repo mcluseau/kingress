@@ -162,7 +162,7 @@ var statusTemplate = template.Must(template.New("status").
 <tr><td>{{ $host }}</td>
     <td>{{ .Prefix }}</td>
     <td>{{ .IngressRef }}</td>
-    <td>{{ range $k, $v := .Options.Get }}{{if .}}<span class="badge badge-info">{{$k}}{{ if ne true . }}:{{.}}{{end}}</span> {{end}}{{end}}</td>
+    <td>{{ range $k, $v := .Options.Get }}{{if .}}<span class="badge badge-info">{{$k}}:{{.}}</span> {{end}}{{end}}</td>
     <td>{{ range .Targets }}<span class="badge badge-info">{{.}}</span> {{end}}</td>
 </tr>
 {{ end }}{{ end }}

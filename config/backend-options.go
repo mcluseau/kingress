@@ -9,6 +9,7 @@ type BackendOptions struct {
 	SSLRedirect          bool
 	SecureBackends       bool
 	WhitelistSourceRange []*net.IPNet
+	CORSAllowedOrigins   []string
 }
 
 func (o *BackendOptions) Set(key, value string) (bool, error) {
@@ -26,8 +27,8 @@ func (o *BackendOptions) Set(key, value string) (bool, error) {
 	return true, err
 }
 
-func (o *BackendOptions) Get() map[string]interface{} {
-	ret := make(map[string]interface{}, len(Annotations))
+func (o *BackendOptions) Get() map[string]any {
+	ret := make(map[string]any, len(Annotations))
 	for _, ann := range Annotations {
 		ret[ann.Name] = ann.get(o)
 	}

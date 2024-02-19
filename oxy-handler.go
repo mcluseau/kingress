@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/vulcand/oxy/forward"
@@ -96,6 +98,54 @@ func (h *oxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logCh <- startLog
 
 	if len(startLog.Reject) != 0 {
+		return
+	}
+
+	if len(backend.Options.CORSAllowedOrigins) != 0 &&
+		r.Method == http.MethodOptions &&
+		r.Header.Get("Access-Control-Request-Method") != "" {
+		// handle CORS response here
+		hdr := w.Header()
+		origin := r.Header.Get("Origin")
+
+		allowed := false
+
+		if originURL, err := url.Parse(origin); err == nil {
+			for _, allowedOrigin := range backend.Options.CORSAllowedOrigins {
+				if len(allowedOrigin) == 0 {
+					continue
+				}
+
+				suffix, hasWildcardPrefix := strings.CutPrefix(allowedOrigin, "*")
+				if hasWildcardPrefix {
+					if strings.HasSuffix(originURL.Hostname(), suffix) {
+						allowed = true
+						break
+					}
+				} else {
+					if origin == allowedOrigin {
+						allowed = true
+						break
+					}
+				}
+			}
+		}
+
+		if !allowed {
+			http.Error(w, "origin not allowed\n", http.StatusForbidden)
+			return
+		}
+
+		hdr.Set("Access-Control-Allow-Origin", origin)
+
+		hdr.Add("Vary", "Access-Control-Request-Method")
+		hdr.Add("Vary", "Access-Control-Request-Headers")
+
+		hdr.Set("Access-Control-Allow-Credentials", "true")
+		hdr.Set("Access-Control-Allow-Headers", "*")
+
+		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
 
