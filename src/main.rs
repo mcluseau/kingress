@@ -8,6 +8,7 @@ use k8s_openapi::{
 use kube::{api::Api, runtime::watcher, Client};
 use log::{debug, error, info, log_enabled, trace};
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
+use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::{sync::watch, time::Duration};
@@ -21,6 +22,10 @@ struct Cli {
     no_api: bool,
     #[arg(long, default_value = "127.0.0.1:2287")]
     api: std::net::SocketAddr,
+    #[arg(long, default_value = "cluster.local")]
+    cluster_domain: String,
+    #[arg(long, default_value = "/run/knot/knot.sock")]
+    knot_socket: String,
 }
 
 #[tokio::main]
@@ -51,33 +56,101 @@ async fn main() -> eyre::Result<()> {
         tokio::spawn(api_server(cli.api, cfg_rx.clone()));
     }
 
+    let mut zone_serial = 0u32;
+    let mut zone = Vec::<u8>::new();
+
     loop {
         cfg_rx.changed().await?;
         let Some(cfg) = cfg_rx.borrow_and_update().clone() else {
             continue;
         };
-        let cfg = cfg.as_ref();
 
-        debug!("new config received");
         if log_enabled!(log::Level::Debug) {
-            for (host, cfg) in cfg {
-                debug!("- {host}");
+            let mut buf = Vec::new();
+
+            writeln!(buf, "proxy:")?;
+            for (host, cfg) in cfg.proxy.as_ref() {
+                writeln!(buf, "- {host}")?;
                 if let Some(key) = &cfg.tls_secret {
-                    debug!("  - tls from {key}");
+                    writeln!(buf, "  - tls from {key}")?;
                 }
                 for (path, m) in &cfg.exact_matches {
-                    debug!("  - {path} => {}", m.iter().join(", "));
+                    writeln!(buf, "  - {path} => {}", m.iter().join(", "))?;
                 }
                 for (path, m) in &cfg.prefix_matches {
-                    debug!("  - {path}* => {}", m.iter().join(", "));
+                    writeln!(buf, "  - {path}* => {}", m.iter().join(", "))?;
                 }
-                debug!("  - * => {}", cfg.any_match.iter().join(", "));
+                writeln!(buf, "  - * => {}", cfg.any_match.iter().join(", "))?;
             }
+
+            writeln!(buf, "\ndns:")?;
+            for (name, targets) in cfg.dns.as_ref() {
+                for target in targets {
+                    writeln!(buf, "  {name} {target}")?;
+                }
+            }
+
+            debug!("new config received:\n{}", String::from_utf8_lossy(&buf));
+        }
+
+        {
+            let ttl = 5;
+            let knot_socket = cli.knot_socket.as_str();
+            let cluster_zone = cli.cluster_domain.as_str();
+
+            zone_serial += 1;
+            zone.clear();
+
+            // SOA record
+            writeln!(
+                zone,
+                "@ 5 SOA ns.dns clusteradmin {zone_serial} 7200 1800 86400 {ttl}"
+            )?;
+            writeln!(zone, "@ NS localhost.localdomain.")?;
+
+            for (name, targets) in cfg.dns.as_ref() {
+                for target in targets {
+                    writeln!(zone, "{name} {ttl} {target}")?;
+                }
+            }
+
+            tokio::fs::write("cluster.zone", &zone).await?;
+
+            debug!("reloading zone {cluster_zone}");
+            tokio::process::Command::new("knotc")
+                .args(["-s", knot_socket, "--blocking", "zone-reload", cluster_zone])
+                .status()
+                .await?;
         }
     }
 }
 
-type ConfigReceiver = watch::Receiver<Option<Arc<ProxyConfig>>>;
+#[derive(Clone, serde::Serialize)]
+struct Config {
+    dns: Arc<DNSConfig>,
+    proxy: Arc<ProxyConfig>,
+}
+
+type ConfigReceiver = watch::Receiver<Option<Config>>;
+type DNSConfig = Map<String, Vec<DNSEntry>>;
+type ProxyConfig = Map<String, HostConfig>;
+
+#[derive(Debug, serde::Serialize)]
+enum DNSEntry {
+    IP(IpAddr),
+    Name(String),
+}
+impl std::fmt::Display for DNSEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Self::IP(ip) => match ip {
+                IpAddr::V4(ip) => write!(f, "A {ip}"),
+                IpAddr::V6(ip) => write!(f, "AAAA {ip}"),
+            },
+            Self::Name(alias) => write!(f, "CNAME {alias}"),
+        }
+    }
+}
 
 async fn api_server(bind: impl Into<std::net::SocketAddr>, cfg_rx: ConfigReceiver) {
     use warp::Filter;
@@ -92,14 +165,12 @@ async fn api_server(bind: impl Into<std::net::SocketAddr>, cfg_rx: ConfigReceive
     warp::serve(server).try_bind(bind).await;
 }
 
-type ProxyConfig = Map<String, HostConfig>;
-
 struct KubeWatcher {
     client: Client,
     watcher_config: watcher::Config,
     state: WatcherState,
     namespace: Option<String>,
-    tx: watch::Sender<Option<Arc<ProxyConfig>>>,
+    tx: watch::Sender<Option<Config>>,
 }
 impl KubeWatcher {
     fn new(
@@ -161,11 +232,47 @@ impl KubeWatcher {
             //dump_json(&ep_slices.iter().collect::<Vec<_>>());
             //dump_json(&services.iter().collect::<Vec<_>>());
 
-            let mut config = Map::<String, HostConfig>::new();
+            // assemble DNS config
+            let mut dns = DNSConfig::new();
+
+            for (key, svc) in &self.state.services {
+                let name = format!("{}.{}.svc", key.name, key.namespace);
+
+                let targets = match &svc.target {
+                    ServiceTarget::None => {
+                        continue;
+                    }
+                    ServiceTarget::Name(name) => vec![DNSEntry::Name(name.clone())],
+                    ServiceTarget::ClusterIPs(ips) => {
+                        ips.iter().map(|ip| DNSEntry::IP(ip.clone())).collect()
+                    }
+                    ServiceTarget::Headless => {
+                        EndpointSlice::for_service(key, &self.state.ep_slices)
+                            .iter()
+                            .map(|(_, v)| v)
+                            .map(|ep_slice| ep_slice.endpoints.iter())
+                            .flatten()
+                            .unique()
+                            .map(|(pod_name, ip)| {
+                                let sub_name = format!("{pod_name}.{name}");
+                                dns.entry(sub_name.clone())
+                                    .or_default()
+                                    .push(DNSEntry::IP(ip.clone()));
+                                DNSEntry::IP(ip.clone())
+                            })
+                            .collect()
+                    }
+                };
+
+                dns.entry(name).or_default().extend(targets);
+            }
+
+            // assemble proxy config
+            let mut proxy = ProxyConfig::new();
 
             for (key, ing) in &self.state.ingresses {
                 for rule in &ing.rules {
-                    let host_config = config.entry(rule.host.clone()).or_default();
+                    let host_config = proxy.entry(rule.host.clone()).or_default();
 
                     if let Some(tls_secret) = rule.tls_secret.as_ref() {
                         host_config.tls_secret = Some(ObjectKey {
@@ -198,7 +305,10 @@ impl KubeWatcher {
 
             //dump_json(&config);
 
-            self.tx.send_replace(Some(Arc::new(config)));
+            self.tx.send_replace(Some(Config {
+                dns: Arc::new(dns),
+                proxy: Arc::new(proxy),
+            }));
         }
     }
 }
@@ -383,7 +493,16 @@ trait KeyValueFrom<V>: Sized {
 }
 
 #[derive(serde::Serialize)]
+enum ServiceTarget {
+    None,
+    Headless,
+    ClusterIPs(Set<IpAddr>),
+    Name(String),
+}
+
+#[derive(serde::Serialize)]
 struct Service {
+    target: ServiceTarget,
     ports: Map<u16, String>,
 }
 impl KeyValueFrom<core::Service> for Service {
@@ -395,7 +514,35 @@ impl KeyValueFrom<core::Service> for Service {
     }
 
     fn value_from(svc: &core::Service) -> Result<Self, Self::Error> {
+        let target = if let Some(spec) = &svc.spec {
+            match spec.type_.as_ref().map(|s| s.as_str()) {
+                None => ServiceTarget::None,
+                Some("ExternalName") => match &spec.external_name {
+                    None => ServiceTarget::None,
+                    Some(name) => ServiceTarget::Name(name.clone()),
+                },
+                Some("ClusterIP") | Some("NodePort") | Some("LoadBalancer") => {
+                    match &spec.cluster_ips {
+                        None => ServiceTarget::None,
+                        Some(ips) => {
+                            if ips.iter().map(|s| s.as_str()).contains(&"None") {
+                                ServiceTarget::Headless
+                            } else {
+                                ServiceTarget::ClusterIPs(
+                                    ips.iter().filter_map(|ip| ip.parse().ok()).collect(),
+                                )
+                            }
+                        }
+                    }
+                }
+                _ => ServiceTarget::None,
+            }
+        } else {
+            ServiceTarget::None
+        };
+
         Ok(Self {
+            target,
             ports: svc
                 .spec
                 .as_ref()
@@ -435,7 +582,26 @@ impl std::fmt::Display for ObjectKey {
 #[derive(serde::Serialize)]
 struct EndpointSlice {
     target_ports: Map<String, u16>,
-    endpoints: Set<IpAddr>,
+    endpoints: Set<(String, IpAddr)>,
+}
+impl EndpointSlice {
+    fn for_service<'a>(
+        service_key: &ObjectKey,
+        ep_slices: &'a Map<EndpointSliceKey, Self>,
+    ) -> Vec<(&'a EndpointSliceKey, &'a Self)> {
+        let key_min = EndpointSliceKey {
+            namespace: service_key.namespace.clone(),
+            service_name: service_key.name.clone(),
+            name: String::new(),
+        };
+
+        use std::ops::Bound;
+
+        ep_slices
+            .range((Bound::Included(key_min), Bound::Unbounded))
+            .take_while(|(k, _)| k.is_service(service_key))
+            .collect()
+    }
 }
 impl KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
     type Key = EndpointSliceKey;
@@ -490,10 +656,14 @@ impl KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
                     })
                 })
                 .filter_map(|ep| {
+                    let Some(pod_name) = ep.target_ref.as_ref().and_then(|t| t.name.clone()) else {
+                        return None;
+                    };
                     ep.addresses
                         .iter()
                         .filter_map(|addr| addr.parse().ok())
                         .next()
+                        .map(|addr| (pod_name, addr))
                 })
                 .collect(),
         })
@@ -634,24 +804,12 @@ impl IngressMatch {
             return endpoints;
         };
 
-        let key_min = EndpointSliceKey {
-            namespace: service_key.namespace.clone(),
-            service_name: service_key.name.clone(),
-            name: String::new(),
-        };
-
-        use std::ops::Bound;
-
-        let slices = ep_slices
-            .range((Bound::Included(key_min), Bound::Unbounded))
-            .take_while(|(k, _)| k.is_service(&service_key));
-
-        for (_, slice) in slices {
+        for (_, slice) in EndpointSlice::for_service(&service_key, &ep_slices) {
             let Some(port) = slice.target_ports.get(port_name) else {
                 continue;
             };
 
-            for addr in &slice.endpoints {
+            for (_, addr) in &slice.endpoints {
                 endpoints.insert(Endpoint {
                     ip: addr.clone(),
                     port: port.clone(),
