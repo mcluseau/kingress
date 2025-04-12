@@ -61,7 +61,12 @@ func watchK8s(c cache.Getter, resource, selector string, objType runtime.Object,
 
 	lw := cache.NewListWatchFromClient(c, resource, *namespace, sel)
 
-	_, ctr := cache.NewInformer(lw, objType, *resyncPeriod, h)
+	_, ctr := cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: lw,
+		ObjectType:    objType,
+		Handler:       h,
+		ResyncPeriod:  *resyncPeriod,
+	})
 
 	wg.Add(1)
 	go func() {

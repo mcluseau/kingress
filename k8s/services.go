@@ -19,7 +19,7 @@ type servicePort struct {
 
 type servicesHandler struct{}
 
-func (h servicesHandler) OnAdd(obj interface{}) {
+func (h servicesHandler) OnAdd(obj interface{}, isInInitialList bool) {
 	h.update(obj.(*core.Service))
 }
 

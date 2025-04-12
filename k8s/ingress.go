@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -42,15 +41,15 @@ type ingressHandler struct {
 	Hosts   []string
 }
 
-func (h ingressHandler) OnAdd(obj interface{}) {
+func (h ingressHandler) OnAdd(obj any, isInInitialList bool) {
 	h.update(obj.(*netv1.Ingress))
 }
 
-func (h ingressHandler) OnUpdate(oldObj, newObj interface{}) {
+func (h ingressHandler) OnUpdate(oldObj, newObj any) {
 	h.update(newObj.(*netv1.Ingress))
 }
 
-func (h ingressHandler) OnDelete(obj interface{}) {
+func (h ingressHandler) OnDelete(obj any) {
 	h.delete(obj.(*netv1.Ingress))
 }
 
@@ -140,10 +139,10 @@ func (h ingressHandler) update(ing *netv1.Ingress) {
 	config.NotifyChanged(newConfig)
 
 	// also check & update the status as needed
-	lb := v1.LoadBalancerStatus{}
+	lb := netv1.IngressLoadBalancerStatus{}
 
 	for _, host := range h.LBHosts {
-		lbi := v1.LoadBalancerIngress{}
+		lbi := netv1.IngressLoadBalancerIngress{}
 
 		if net.ParseIP(host) != nil {
 			lbi.IP = host

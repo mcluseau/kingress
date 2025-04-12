@@ -19,7 +19,7 @@ var (
 
 type secretsHandler struct{}
 
-func (h secretsHandler) OnAdd(obj interface{}) {
+func (h secretsHandler) OnAdd(obj interface{}, isInInitialList bool) {
 	h.update(obj.(*core.Secret))
 }
 func (h secretsHandler) OnUpdate(oldObj, newObj interface{}) {

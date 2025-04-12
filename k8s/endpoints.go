@@ -21,7 +21,7 @@ type endpointSpec struct {
 
 type endpointsHandler struct{}
 
-func (h endpointsHandler) OnAdd(obj interface{}) {
+func (h endpointsHandler) OnAdd(obj interface{}, isInInitialList bool) {
 	h.update(obj.(*core.Endpoints))
 }
 
