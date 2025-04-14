@@ -1,4 +1,12 @@
-from mcluseau/golang-builder:1.21.6 as build
-from alpine:3.19
+from mcluseau/rust:1.86.0 as build
+
+workdir /app
+copy . .
+
+run --mount=type=cache,id=rust-alpine-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=rust-alpine-target,sharing=private,target=/app/target \
+    cargo install --root=/dist --path .
+
+from alpine:3.21
 entrypoint ["/bin/kingress"]
-copy --from=build /go/bin/* /bin/
+copy --from=build /dist/* /bin/

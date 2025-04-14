@@ -1,0 +1,21 @@
+#! /bin/sh
+set -e
+
+tag=${1:-latest}
+
+echo "*** building tag $tag"
+
+img=mcluseau/kingress:$tag
+
+docker build -t $img .
+
+read -p "push?"
+docker push $img
+
+if [ $tag == latest ]; then
+  exit
+fi
+
+git commit -am "version $tag"
+git tag -am $tag $tag
+

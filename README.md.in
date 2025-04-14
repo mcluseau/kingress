@@ -12,12 +12,8 @@ kubectl run kingress --image mcluseau/kingress
 # expose HTTPS
 kubectl expose deploy kingress --name kingress-https --port 443 --external-ip=$ip
 
-# expose HTTP (following ingress rules)
+# expose HTTP
 kubectl expose deploy kingress --name kingress-http --port 80 --external-ip=$ip
-
-# expose HTTP (always redirecting to HTTPS)
-# you must add something like `-ssl-redirect=:81` to the container args
-kubectl expose deploy kingress --name kingress-http2https --port 80 --target-port 81 --external-ip=$ip
 ```
 
 ## Supported annotations
@@ -31,12 +27,13 @@ The following annotations are supported:
 
 | Annotation | Description |
 | --- | --- |
-{{- range .annotations }}
-| `{{ .Name -}}` | {{ .Description }} |
-{{- end }}
+| `secure-backends` | Make TLS connections to the upstream instead of plain HTTP. Initialy from ingress-nginx but removed from it, we still support it. |
+| `ssl-redirect` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#server-side-https-enforcement-through-redirect) |
+| `whitelist-source-range` | From [ingress-nginx](https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/annotations.md#whitelist-source-range) |
+| `http2` | Allow HTTP/2 in TLS connections (works only for ingresses with a single '\*' match) |
 
 ## Command line flags
 
 ```
-{{ sh "kingress -h" }}
+{{ sh "./kingress -h" }}
 ```

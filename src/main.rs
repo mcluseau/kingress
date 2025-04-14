@@ -1,17 +1,23 @@
 use clap::Parser;
+use eyre::{format_err, Result};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use k8s_openapi::{
-    api::{core::v1 as core, discovery::v1 as discovery, networking::v1 as networking},
+    api::{core::v1 as core, networking::v1 as networking},
     apimachinery::pkg::apis::meta::v1 as meta,
 };
 use kube::{api::Api, runtime::watcher, Client};
-use log::{debug, error, info, log_enabled, trace};
-use std::collections::{BTreeMap as Map, BTreeSet as Set};
+use log::{debug, error, info, trace, warn};
+use openssl::ssl;
+use std::collections::BTreeMap as Map;
 use std::io::Write;
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net;
 use tokio::{sync::watch, time::Duration};
+
+const LEGACY_XFORWARDED: bool = true;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -20,12 +26,14 @@ struct Cli {
     namespace: Option<String>,
     #[arg(long)]
     no_api: bool,
-    #[arg(long, default_value = "127.0.0.1:2287")]
-    api: std::net::SocketAddr,
-    #[arg(long, default_value = "cluster.local")]
-    cluster_domain: String,
-    #[arg(long, default_value = "/run/knot/knot.sock")]
-    knot_socket: String,
+    #[arg(long, default_value = "[::]:80")]
+    http: SocketAddr,
+    #[arg(long, default_value = "[::]:443")]
+    https: SocketAddr,
+    #[arg(long, default_value = "[::1]:2287")]
+    api: SocketAddr,
+    #[arg(long)]
+    cluster_domain: Option<String>,
 }
 
 #[tokio::main]
@@ -43,147 +51,434 @@ async fn main() -> eyre::Result<()> {
     };
 
     let client: Client = kube::Config::infer().await?.try_into()?;
-    let watcher_config = watcher::Config::default();
-    let (mut watcher, mut cfg_rx) = KubeWatcher::new(client, watcher_config, cli.namespace);
+    let (mut watcher, hosts_rx) = KubeWatcher::new(client, cli.namespace);
 
-    tokio::spawn(async move {
+    let cfg = Config {
+        cluster_domain: cli.cluster_domain.map_or("", |s| s.leak()),
+        hosts: hosts_rx,
+    };
+    if !CONFIG.set(cfg).is_ok() {
+        panic!("config already set");
+    }
+
+    let mut join = tokio::task::JoinSet::new();
+
+    join.spawn(async move {
         if let Err(e) = watcher.run(Duration::from_secs(1)).await {
             panic!("k8s watcher failed: {e}");
         }
     });
 
     if !cli.no_api {
-        tokio::spawn(api_server(cli.api, cfg_rx.clone()));
+        info!("starting API on {}", cli.api);
+        join.spawn(api_server(cli.api));
     }
 
-    let mut zone_serial = 0u32;
-    let mut zone = Vec::<u8>::new();
+    join.spawn(http_server(cli.http));
+    join.spawn(https_server(cli.https));
+
+    if let Err(e) = join.join_next().await.unwrap() {
+        error!("a process failed: {e}");
+    } else {
+        error!("a process stopped with no error");
+    }
+    std::process::exit(1);
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+fn cfg() -> &'static Config {
+    CONFIG.get().expect("config accessed before initialization")
+}
+
+#[derive(Clone)]
+struct Config {
+    cluster_domain: &'static str,
+    hosts: HostsReceiver,
+}
+
+type HostsReceiver = watch::Receiver<Arc<Hosts>>;
+type Hosts = Map<String, Arc<HostConfig>>;
+
+async fn http_server(bind: SocketAddr) {
+    info!("starting HTTP on {bind}");
+
+    let listener = (net::TcpListener::bind(bind).await).expect("HTTP failed to listen");
 
     loop {
-        cfg_rx.changed().await?;
-        let Some(cfg) = cfg_rx.borrow_and_update().clone() else {
-            continue;
+        let (sock, remote) = listener.accept().await.expect("HTTP listener failed");
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(sock, &remote, "http").await {
+                error!("{remote}: failed: {e}");
+            }
+        });
+    }
+}
+
+async fn https_server(bind: SocketAddr) {
+    info!("starting HTTPS on {bind}");
+
+    let listener = (net::TcpListener::bind(bind).await).expect("HTTPS failed to listen");
+
+    let ssl_ctx = build_ssl_server_context();
+
+    loop {
+        let (sock, remote) = listener.accept().await.expect("HTTPS listener failed");
+
+        let ssl_ctx = ssl_ctx.clone();
+
+        tokio::spawn(async move {
+            let Ok(ssl) =
+                ssl::Ssl::new(&ssl_ctx).inspect_err(|e| error!("failed to setup SSL: {e}"))
+            else {
+                return;
+            };
+
+            let Ok(stream) = tokio_openssl::SslStream::new(ssl, sock)
+                .inspect_err(|e| info!("failed to create SSL stream: {e}"))
+            else {
+                return;
+            };
+
+            let mut stream = std::pin::pin!(stream);
+            if let Err(e) = stream.as_mut().accept().await {
+                debug!("{remote}: TLS not accepted: {e}");
+                return;
+            }
+
+            let proto = stream.ssl().selected_alpn_protocol();
+            if proto == Some(b"h2") {
+                // HTTP/2 conditions are met: ingress with a single any match
+                // This allows direct copy of the client/backend stream.
+
+                // SNI is required -> servername is always set
+                let server_name = stream.ssl().servername(ssl::NameType::HOST_NAME).unwrap();
+
+                let Some(host_cfg) = get_host_cfg(server_name) else {
+                    error!("{remote}: host {server_name} vanished");
+                    return;
+                };
+
+                let Some(ref endpoint) = host_cfg.any_match else {
+                    error!("{remote}: host {server_name} lost its \"*\" match");
+                    return;
+                };
+
+                let Ok((backend, backend_addr)) = connect_to_backend(endpoint).await else {
+                    return;
+                };
+                let Ok(backend) = connect_tls(backend, endpoint, b"\x02h2").await else {
+                    return;
+                };
+
+                if let Err(e) = forward_to_backend(Vec::new(), stream, backend).await {
+                    warn!("{remote}: forwarding to {backend_addr} failed: {e}");
+                }
+                return;
+            }
+
+            if let Err(e) = handle_connection(stream, &remote, "https").await {
+                error!("{remote}: failed: {e}");
+            }
+        });
+    }
+}
+
+fn build_ssl_server_context() -> ssl::SslContext {
+    use ssl::{AlpnError, NameType, SniError, SslContextBuilder, SslMethod};
+
+    let mut builder = SslContextBuilder::new(SslMethod::tls_server()).unwrap();
+    builder.set_servername_callback(move |ssl, _alert| {
+        let Some(server_name) = ssl.servername(NameType::HOST_NAME) else {
+            debug!("no server name provided");
+            return Err(SniError::ALERT_FATAL);
         };
 
-        if log_enabled!(log::Level::Debug) {
-            let mut buf = Vec::new();
+        let Some(host_cfg) = get_host_cfg(server_name) else {
+            debug!("unknown host: {server_name}");
+            return Err(SniError::ALERT_FATAL);
+        };
+        let Some(key_cert) = host_cfg.tls_key_cert.as_ref() else {
+            debug!("host {server_name} has no certificate");
+            return Err(SniError::ALERT_FATAL);
+        };
 
-            writeln!(buf, "proxy:")?;
-            for (host, cfg) in cfg.proxy.as_ref() {
-                writeln!(buf, "- {host}")?;
-                if let Some(key) = &cfg.tls_secret {
-                    writeln!(buf, "  - tls from {key}")?;
-                }
-                for (path, m) in &cfg.exact_matches {
-                    writeln!(buf, "  - {path} => {}", m.iter().join(", "))?;
-                }
-                for (path, m) in &cfg.prefix_matches {
-                    writeln!(buf, "  - {path}* => {}", m.iter().join(", "))?;
-                }
-                writeln!(buf, "  - * => {}", cfg.any_match.iter().join(", "))?;
-            }
+        ssl.set_private_key(&key_cert.key)
+            .map_err(|_| SniError::ALERT_FATAL)?;
+        ssl.set_certificate(&key_cert.cert)
+            .map_err(|_| SniError::ALERT_FATAL)?;
 
-            writeln!(buf, "\ndns:")?;
-            for (name, targets) in cfg.dns.as_ref() {
-                for target in targets {
-                    writeln!(buf, "  {name} {target}")?;
-                }
-            }
+        Ok(())
+    });
 
-            debug!("new config received:\n{}", String::from_utf8_lossy(&buf));
-        }
+    builder.set_alpn_select_callback(move |ssl, client_protos| {
+        let Some(server_name) = ssl.servername(NameType::HOST_NAME) else {
+            return Err(AlpnError::ALERT_FATAL);
+        };
+        let Some(host_cfg) = get_host_cfg(server_name) else {
+            return Err(AlpnError::ALERT_FATAL);
+        };
 
-        {
-            let ttl = 5;
-            let knot_socket = cli.knot_socket.as_str();
-            let cluster_zone = cli.cluster_domain.as_str();
+        let server_protos = if host_cfg.is_h2_ready() {
+            b"\x02h2\x08http/1.1".as_slice()
+        } else {
+            b"\x08http/1.1".as_slice()
+        };
 
-            zone_serial += 1;
-            zone.clear();
+        ssl::select_next_proto(server_protos, client_protos).ok_or(AlpnError::ALERT_FATAL)
+    });
 
-            // SOA record
-            writeln!(
-                zone,
-                "@ 5 SOA ns.dns clusteradmin {zone_serial} 7200 1800 86400 {ttl}"
-            )?;
-            writeln!(zone, "@ NS localhost.localdomain.")?;
+    builder.build()
+}
 
-            for (name, targets) in cfg.dns.as_ref() {
-                for target in targets {
-                    writeln!(zone, "{name} {ttl} {target}")?;
-                }
-            }
+fn http_response(status: &str, message: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}\r\n",
+        status,
+        message.len() + 2,
+        message
+    )
+    .into_bytes()
+}
 
-            tokio::fs::write("cluster.zone", &zone).await?;
+macro_rules! http_response {
+    ($status:expr) => {
+        &http_response($status, $status)
+    };
+}
 
-            debug!("reloading zone {cluster_zone}");
-            tokio::process::Command::new("knotc")
-                .args(["-s", knot_socket, "--blocking", "zone-reload", cluster_zone])
-                .status()
-                .await?;
-        }
+async fn handle_connection<RW>(sock: RW, remote: &SocketAddr, forwarded_proto: &str) -> Result<()>
+where
+    RW: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut read = tokio::io::BufReader::with_capacity(4096, sock);
+
+    macro_rules! reply {
+        ($status:expr) => {{
+            let _ = (read.into_inner())
+                .write(&http_response($status, $status))
+                .await;
+            return Ok(());
+        }};
+        ($status:expr, $message:expr) => {{
+            let _ = (read.into_inner())
+                .write(&http_response($status, $message))
+                .await;
+            return Ok(());
+        }};
     }
-}
-
-#[derive(Clone, serde::Serialize)]
-struct Config {
-    dns: Arc<DNSConfig>,
-    proxy: Arc<ProxyConfig>,
-}
-
-type ConfigReceiver = watch::Receiver<Option<Config>>;
-type DNSConfig = Map<String, Vec<DNSEntry>>;
-type ProxyConfig = Map<String, HostConfig>;
-
-#[derive(Debug, serde::Serialize)]
-enum DNSEntry {
-    IP(IpAddr),
-    Name(String),
-}
-impl std::fmt::Display for DNSEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self {
-            Self::IP(ip) => match ip {
-                IpAddr::V4(ip) => write!(f, "A {ip}"),
-                IpAddr::V6(ip) => write!(f, "AAAA {ip}"),
-            },
-            Self::Name(alias) => write!(f, "CNAME {alias}"),
-        }
+    macro_rules! reply_bad_request {
+        ($message:expr) => {
+            reply!("400 Bad Request", $message)
+        };
     }
+
+    let mut get_line = String::new();
+    match (&mut read).take(8192).read_line(&mut get_line).await {
+        Ok(0) => reply!("414 URI Too Long"),
+        Ok(_) => {}
+        Err(e) => Err(e)?,
+    }
+
+    let Some((_method, full_req_path)) = get_line.trim_ascii_end().split_once(' ') else {
+        reply_bad_request!("invalid request line");
+    };
+    let Some((full_req_path, _proto)) = full_req_path.split_once(' ') else {
+        reply_bad_request!("invalid request line: no protocol");
+    };
+
+    let req_path = full_req_path
+        .split_once('?')
+        .map(|(p, _)| p)
+        .unwrap_or(full_req_path);
+
+    let mut host_line = String::new();
+    match (&mut read).take(512).read_line(&mut host_line).await {
+        Ok(0) => reply!("413 Content Too Large"),
+        Ok(_) => {}
+        Err(e) => Err(e)?,
+    }
+
+    let Some((hdr_name, hdr_value)) = host_line.split_once(":") else {
+        reply_bad_request!("invalid header");
+    };
+
+    if !hdr_name.eq_ignore_ascii_case("host") {
+        reply_bad_request!("first header must be Host");
+    }
+
+    let hdr_value = hdr_value.trim_ascii();
+    let host = hdr_value
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(hdr_value);
+
+    debug!("{remote}: requested {host} {req_path}");
+
+    /* TODO check readiness
+    let Some(cfg) = cfg else {
+        reply!("503 Service Unavailable");
+    };
+    // */
+
+    let Some(host_cfg) = get_host_cfg(host) else {
+        reply!("404 Not Found", "Unknown host");
+    };
+
+    let Some(endpoint) = host_cfg.endpoint_for(req_path) else {
+        reply!("503 Service Unavailable");
+    };
+
+    debug!("{remote}: mapped to {endpoint}");
+
+    if endpoint.opts.ssl_redirect && forwarded_proto != "https" {
+        let target_url = format!("https://{host}{full_req_path}");
+        let _ = read
+            .into_inner()
+            .write(
+                format!("HTTP/1.1 301 Moved Permanently\r\nLocation: {target_url}\r\n\r\n<a href=\"{target_url}\">Moved Permanently</a>.\n")
+                    .as_bytes(),
+            )
+            .await;
+        return Ok(());
+    }
+
+    let (backend, backend_addr) = match connect_to_backend(&endpoint).await {
+        Ok(b) => b,
+        Err(BackendError::LookupFailed) => reply!("503 Service Unavailable"),
+        Err(BackendError::ConnectFailed) => reply!("502 Bad Gateway"),
+    };
+
+    let mut initial_data = Vec::new();
+    initial_data.extend_from_slice(get_line.as_bytes());
+    initial_data.extend_from_slice(host_line.as_bytes());
+    write!(
+        initial_data,
+        "Forwarded: for=\"{remote}\";proto={forwarded_proto}\r\n"
+    )?;
+    if LEGACY_XFORWARDED {
+        write!(
+            initial_data,
+            "X-Forwarded-For: {remote}\r\nX-Forwarded-Proto: {forwarded_proto}\r\n"
+        )?;
+    }
+    initial_data.extend_from_slice(read.buffer());
+
+    let result = if endpoint.opts.secure_backends {
+        let backend = (connect_tls(backend, &endpoint, b"\x08http/1.1").await)
+            .map_err(|e| format_err!("{backend_addr}: tls failed: {e}"))?;
+
+        forward_to_backend(initial_data, read.into_inner(), backend).await
+    } else {
+        forward_to_backend(initial_data, read.into_inner(), backend).await
+    };
+
+    if let Err(e) = result {
+        warn!("{remote}: forwarding to {backend_addr} failed: {e}");
+    }
+    Ok(())
 }
 
-async fn api_server(bind: impl Into<std::net::SocketAddr>, cfg_rx: ConfigReceiver) {
+#[derive(Debug)]
+enum BackendError {
+    LookupFailed,
+    ConnectFailed,
+}
+
+async fn connect_to_backend(
+    endpoint: &Endpoint,
+) -> std::result::Result<(net::TcpStream, SocketAddr), BackendError> {
+    let cluster_domain = cfg().cluster_domain;
+
+    let full_host = if cluster_domain.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{}.{cluster_domain}.:{}", endpoint.host, endpoint.port)
+    };
+
+    let backends = (net::lookup_host(&full_host).await)
+        .map_err(|e| {
+            warn!("failed to lookup {full_host}: {e}");
+            BackendError::LookupFailed
+        })?
+        .collect_vec();
+
+    let backend_addr = match backends.len() {
+        0 => return Err(BackendError::LookupFailed),
+        1 => backends[0],
+        n => backends[fastrand::usize(..n)],
+    };
+
+    let stream = net::TcpStream::connect(backend_addr).await.map_err(|e| {
+        warn!("failed to connect to {backend_addr}: {e}");
+        BackendError::ConnectFailed
+    })?;
+
+    Ok((stream, backend_addr))
+}
+
+async fn connect_tls(
+    stream: net::TcpStream,
+    _endpoint: &Endpoint,
+    alpn_protos: &[u8],
+) -> Result<tokio_openssl::SslStream<net::TcpStream>> {
+    use ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
+    use std::pin::Pin;
+
+    let mut ssl_ctx = SslContextBuilder::new(SslMethod::tls_client())?;
+
+    ssl_ctx.set_alpn_protos(alpn_protos)?;
+
+    // TODO add server-name annotation and check it if set
+    ssl_ctx.set_verify(SslVerifyMode::NONE);
+
+    let ssl_ctx = ssl_ctx.build();
+
+    let ssl = Ssl::new(&ssl_ctx)?;
+
+    let mut stream = tokio_openssl::SslStream::new(ssl, stream)?;
+    Pin::new(&mut stream).connect().await?;
+    Ok(stream)
+}
+
+async fn forward_to_backend<C, B>(
+    initial_data: Vec<u8>,
+    mut client: C,
+    mut backend: B,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = backend.write(&initial_data).await {
+        let _ = client.write(http_response!("502 Bad Gateway")).await;
+        return Err(format_err!("error writing initial data: {e}"));
+    }
+    drop(initial_data);
+
+    let _ = io::copy_bidirectional(&mut client, &mut backend).await;
+    Ok(())
+}
+
+async fn api_server(bind: impl Into<std::net::SocketAddr>) {
     use warp::Filter;
-
-    let server = warp::get()
-        .map(move || cfg_rx.clone())
-        .map(|rx: ConfigReceiver| {
-            let cfg = rx.borrow().clone();
-            warp::reply::json(&cfg)
-        });
-
+    let server = warp::get().map(|| warp::reply::json(&cfg().hosts.borrow().clone()));
     warp::serve(server).try_bind(bind).await;
 }
 
 struct KubeWatcher {
     client: Client,
-    watcher_config: watcher::Config,
     state: WatcherState,
     namespace: Option<String>,
-    tx: watch::Sender<Option<Config>>,
+    tx: watch::Sender<Arc<Hosts>>,
 }
 impl KubeWatcher {
-    fn new(
-        client: Client,
-        watcher_config: watcher::Config,
-        namespace: Option<String>,
-    ) -> (Self, ConfigReceiver) {
-        let (tx, cfg_rx) = watch::channel(None);
+    fn new(client: Client, namespace: Option<String>) -> (Self, HostsReceiver) {
+        let (tx, cfg_rx) = watch::channel(Arc::new(Hosts::new()));
 
         (
             Self {
                 client,
-                watcher_config,
                 namespace,
                 tx,
                 state: WatcherState::new(),
@@ -206,8 +501,8 @@ impl KubeWatcher {
 
     async fn run_once(&mut self) -> eyre::Result<()> {
         let mut streams = match &self.namespace {
-            None => WatcherStreams::all(&self.client, &self.watcher_config),
-            Some(ns) => WatcherStreams::namespaced(&self.client, &self.watcher_config, ns.as_str()),
+            None => WatcherStreams::all(&self.client),
+            Some(ns) => WatcherStreams::namespaced(&self.client, ns.as_str()),
         };
         let mut was_ready = false;
 
@@ -228,180 +523,187 @@ impl KubeWatcher {
                 continue;
             }
 
-            //dump_json(&services.iter().collect::<Vec<_>>());
-            //dump_json(&ep_slices.iter().collect::<Vec<_>>());
-            //dump_json(&services.iter().collect::<Vec<_>>());
-
-            // assemble DNS config
-            let mut dns = DNSConfig::new();
-
-            for (key, svc) in &self.state.services {
-                let name = format!("{}.{}.svc", key.name, key.namespace);
-
-                let targets = match &svc.target {
-                    ServiceTarget::None => {
-                        continue;
-                    }
-                    ServiceTarget::Name(name) => vec![DNSEntry::Name(name.clone())],
-                    ServiceTarget::ClusterIPs(ips) => {
-                        ips.iter().map(|ip| DNSEntry::IP(ip.clone())).collect()
-                    }
-                    ServiceTarget::Headless => {
-                        EndpointSlice::for_service(key, &self.state.ep_slices)
-                            .iter()
-                            .map(|(_, v)| v)
-                            .map(|ep_slice| ep_slice.endpoints.iter())
-                            .flatten()
-                            .unique()
-                            .map(|(pod_name, ip)| {
-                                let sub_name = format!("{pod_name}.{name}");
-                                dns.entry(sub_name.clone())
-                                    .or_default()
-                                    .push(DNSEntry::IP(ip.clone()));
-                                DNSEntry::IP(ip.clone())
-                            })
-                            .collect()
-                    }
-                };
-
-                dns.entry(name).or_default().extend(targets);
-            }
-
             // assemble proxy config
-            let mut proxy = ProxyConfig::new();
+            let mut hosts = Hosts::new();
 
             for (key, ing) in &self.state.ingresses {
                 for rule in &ing.rules {
-                    let host_config = proxy.entry(rule.host.clone()).or_default();
+                    let mut host_config = match hosts.get(&rule.host) {
+                        Some(prev) => (**prev).clone(),
+                        None => Default::default(),
+                    };
 
                     if let Some(tls_secret) = rule.tls_secret.as_ref() {
-                        host_config.tls_secret = Some(ObjectKey {
+                        let key = ObjectKey {
                             namespace: key.namespace.clone(),
                             name: tls_secret.clone(),
-                        });
+                        };
+                        host_config.tls_key_cert = self.state.secrets.get(&key).cloned();
+                        host_config.tls_secret = Some(key);
                     }
 
                     for m in &rule.matches {
-                        let mut endpoints = m.endpoints(
-                            &key.namespace,
-                            &self.state.services,
-                            &self.state.ep_slices,
-                        );
+                        let Some(endpoint) = m.endpoint(&key.namespace, ing.endpoint_opts.clone())
+                        else {
+                            continue;
+                        };
 
                         use PathMatch::*;
                         match &m.path_match {
                             Exact(path) => {
-                                host_config.exact_matches.entry(path.clone()).or_default()
+                                host_config.exact_matches.insert(path.clone(), endpoint);
                             }
                             Prefix(path) => {
-                                host_config.prefix_matches.entry(path.clone()).or_default()
+                                host_config.prefix_matches.insert(path.clone(), endpoint);
                             }
-                            Any => &mut host_config.any_match,
+                            Any => {
+                                host_config.any_match = Some(endpoint);
+                            }
                         }
-                        .append(&mut endpoints);
                     }
+
+                    hosts.insert(rule.host.clone(), Arc::new(host_config));
                 }
             }
 
-            //dump_json(&config);
-
-            self.tx.send_replace(Some(Config {
-                dns: Arc::new(dns),
-                proxy: Arc::new(proxy),
-            }));
+            self.tx.send_replace(Arc::new(hosts));
         }
     }
+}
+
+fn get_host_cfg(name: &str) -> Option<Arc<HostConfig>> {
+    cfg().hosts.borrow().get(&name.to_lowercase()).cloned()
 }
 
 type Stream<T> =
     std::pin::Pin<Box<dyn futures::Stream<Item = watcher::Result<watcher::Event<T>>> + Send>>;
 
 struct WatcherStreams {
-    svc: Stream<core::Service>,
-    eps: Stream<discovery::EndpointSlice>,
     ing: Stream<networking::Ingress>,
+    secrets: Stream<core::Secret>,
 }
 impl WatcherStreams {
-    fn all(client: &Client, watcher_config: &watcher::Config) -> Self {
-        let svcs = Api::<core::Service>::all(client.clone());
-        let svc = watcher(svcs, watcher_config.clone()).boxed();
-
-        let epss = Api::<discovery::EndpointSlice>::all(client.clone());
-        let eps = watcher(epss, watcher_config.clone()).boxed();
-
-        let ings = Api::<networking::Ingress>::all(client.clone());
-        let ing = watcher(ings, watcher_config.clone()).boxed();
-
-        Self { svc, eps, ing }
+    fn all(client: &Client) -> Self {
+        let wcfg = watcher::Config::default();
+        let sec_wcfg = wcfg.clone().fields("type=kubernetes.io/tls");
+        Self {
+            ing: watcher(Api::all(client.clone()), wcfg).boxed(),
+            secrets: watcher(Api::all(client.clone()), sec_wcfg).boxed(),
+        }
     }
 
-    fn namespaced(client: &Client, watcher_config: &watcher::Config, namespace: &str) -> Self {
-        let svcs = Api::<core::Service>::namespaced(client.clone(), namespace);
-        let svc = watcher(svcs, watcher_config.clone()).boxed();
-
-        let epss = Api::<discovery::EndpointSlice>::namespaced(client.clone(), namespace);
-        let eps = watcher(epss, watcher_config.clone()).boxed();
-
-        let ings = Api::<networking::Ingress>::namespaced(client.clone(), namespace);
-        let ing = watcher(ings, watcher_config.clone()).boxed();
-
-        Self { svc, eps, ing }
+    fn namespaced(client: &Client, ns: &str) -> Self {
+        let wcfg = watcher::Config::default();
+        let sec_wcfg = wcfg.clone().fields("type=kubernetes.io/tls");
+        Self {
+            ing: watcher(Api::namespaced(client.clone(), ns), wcfg).boxed(),
+            secrets: watcher(Api::namespaced(client.clone(), ns), sec_wcfg).boxed(),
+        }
     }
 }
 
 struct WatcherState {
-    services: Map<ObjectKey, Service>,
-    ep_slices: Map<EndpointSliceKey, EndpointSlice>,
     ingresses: Map<ObjectKey, Ingress>,
-
-    svcs_ready: bool,
-    epss_ready: bool,
     ings_ready: bool,
+    secrets: Map<ObjectKey, Arc<CertifiedKey>>,
+    secrets_ready: bool,
 }
 impl WatcherState {
     fn new() -> Self {
         Self {
-            services: Map::new(),
-            ep_slices: Map::new(),
             ingresses: Map::new(),
-            svcs_ready: false,
-            epss_ready: false,
             ings_ready: false,
+            secrets: Map::new(),
+            secrets_ready: false,
         }
     }
 
     fn is_ready(&self) -> bool {
-        self.svcs_ready && self.epss_ready && self.ings_ready
+        self.ings_ready && self.secrets_ready
     }
 
     fn clear(&mut self) {
-        self.svcs_ready = false;
-        self.epss_ready = false;
-        self.ings_ready = false;
-        self.services.clear();
-        self.ep_slices.clear();
         self.ingresses.clear();
+        self.ings_ready = false;
+        self.secrets.clear();
+        self.secrets_ready = false;
     }
 
     async fn ingest_any_event(&mut self, streams: &mut WatcherStreams) -> eyre::Result<()> {
         tokio::select!(
-          e = streams.svc.try_next() => {
-              let e = e?.unwrap();
-              trace!("got svc event: {e:?}");
-              self.svcs_ready = ingest_event::<Service, _>(&mut self.services, e);
-          },
-          e = streams.eps.try_next() => {
-              let e = e?.unwrap();
-              trace!("got eps event: {e:?}");
-              self.epss_ready = ingest_event::<EndpointSlice, _>(&mut self.ep_slices, e);
-          },
           e = streams.ing.try_next() => {
               let e = e?.unwrap();
               trace!("got ing event: {e:?}");
               self.ings_ready = ingest_event::<Ingress, _>(&mut self.ingresses, e);
           },
+          e = streams.secrets.try_next() => {
+              let e = e?.unwrap();
+              trace!("got secret event: {e:?}");
+              self.ingest_secret_event(e);
+          },
         );
+
         Ok(())
+    }
+
+    fn ingest_secret_event(&mut self, event: watcher::Event<core::Secret>) {
+        use watcher::Event::*;
+        self.secrets_ready = match event {
+            Init => false,
+            InitApply(sec) => {
+                self.set_secret(sec);
+                false
+            }
+            InitDone => true,
+            Apply(sec) => {
+                self.set_secret(sec);
+                true
+            }
+            Delete(sec) => {
+                self.remove_secret(sec);
+                true
+            }
+        };
+    }
+
+    fn set_secret(&mut self, sec: core::Secret) {
+        let key = ObjectKey::try_from(&sec.metadata).unwrap();
+
+        let Some(data) = sec.data else {
+            return;
+        };
+        let Some(cert) = data.get("tls.crt") else {
+            return;
+        };
+        let Some(tls_key) = data.get("tls.key") else {
+            return;
+        };
+
+        let Ok(ck) = CertifiedKey::from_pem(&tls_key.0, &cert.0)
+            .inspect_err(|e| warn!("invalid (key, cert) in {key}: {e}"))
+        else {
+            return;
+        };
+
+        self.secrets.insert(key, Arc::new(ck));
+    }
+    fn remove_secret(&mut self, sec: core::Secret) {
+        let key = ObjectKey::try_from(&sec.metadata).unwrap();
+        self.secrets.remove(&key);
+    }
+}
+
+struct CertifiedKey {
+    key: openssl::pkey::PKey<openssl::pkey::Private>,
+    cert: openssl::x509::X509,
+}
+impl CertifiedKey {
+    fn from_pem(key_pem: &[u8], crt_pem: &[u8]) -> Result<Self> {
+        use openssl::{pkey::PKey, x509::X509};
+        Ok(Self {
+            key: PKey::private_key_from_pem(key_pem)?,
+            cert: X509::from_pem(crt_pem)?,
+        })
     }
 }
 
@@ -416,16 +718,18 @@ where
     out.write(b"\n").unwrap();
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct HostConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_secret: Option<ObjectKey>,
     #[serde(skip_serializing_if = "Map::is_empty")]
-    exact_matches: Map<String, Set<Endpoint>>,
+    exact_matches: Map<String, Endpoint>,
     #[serde(skip_serializing_if = "Map::is_empty")]
-    prefix_matches: Map<String, Set<Endpoint>>,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    any_match: Set<Endpoint>,
+    prefix_matches: Map<String, Endpoint>,
+    any_match: Option<Endpoint>,
+
+    #[serde(skip_serializing)]
+    tls_key_cert: Option<Arc<CertifiedKey>>,
 }
 impl Default for HostConfig {
     fn default() -> Self {
@@ -433,20 +737,55 @@ impl Default for HostConfig {
             tls_secret: None,
             exact_matches: Map::new(),
             prefix_matches: Map::new(),
-            any_match: Set::new(),
+            any_match: None,
+            tls_key_cert: None,
+        }
+    }
+}
+impl HostConfig {
+    fn is_h2_ready(&self) -> bool {
+        if !(self.exact_matches.is_empty() && self.prefix_matches.is_empty()) {
+            return false;
+        }
+        let Some(any) = self.any_match.as_ref() else {
+            return false;
+        };
+        any.opts.secure_backends && any.opts.http2
+    }
+
+    fn endpoint_for(&self, path: &str) -> Option<Endpoint> {
+        if let Some(ep) = self.exact_matches.get(path) {
+            Some(ep.clone())
+        } else if let Some(ep) = self
+            .prefix_matches
+            .iter()
+            .rev()
+            .find_map(|(k, ep)| path.starts_with(k).then_some(ep))
+        {
+            Some(ep.clone())
+        } else {
+            self.any_match.clone()
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 struct Endpoint {
-    ip: IpAddr,
+    host: String,
     port: u16,
+    opts: EndpointOptions,
 }
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.ip, self.port)
+        write!(f, "{}:{}", self.host, self.port)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+struct EndpointOptions {
+    secure_backends: bool,
+    ssl_redirect: bool,
+    http2: bool,
 }
 
 fn ingest_event<T: KeyValueFrom<V>, V>(map: &mut Map<T::Key, T>, event: watcher::Event<V>) -> bool {
@@ -478,85 +817,11 @@ fn ingest_event<T: KeyValueFrom<V>, V>(map: &mut Map<T::Key, T>, event: watcher:
     }
 }
 
-fn is_tcp(protocol: &Option<String>) -> bool {
-    match protocol {
-        None => true,
-        Some(s) => s.as_str() == "TCP",
-    }
-}
-
 trait KeyValueFrom<V>: Sized {
     type Key: Ord;
     type Error;
     fn key_from(v: &V) -> Result<Self::Key, Self::Error>;
     fn value_from(v: &V) -> Result<Self, Self::Error>;
-}
-
-#[derive(serde::Serialize)]
-enum ServiceTarget {
-    None,
-    Headless,
-    ClusterIPs(Set<IpAddr>),
-    Name(String),
-}
-
-#[derive(serde::Serialize)]
-struct Service {
-    target: ServiceTarget,
-    ports: Map<u16, String>,
-}
-impl KeyValueFrom<core::Service> for Service {
-    type Key = ObjectKey;
-    type Error = &'static str;
-
-    fn key_from(svc: &core::Service) -> Result<Self::Key, Self::Error> {
-        ObjectKey::try_from(&svc.metadata)
-    }
-
-    fn value_from(svc: &core::Service) -> Result<Self, Self::Error> {
-        let target = if let Some(spec) = &svc.spec {
-            match spec.type_.as_ref().map(|s| s.as_str()) {
-                None => ServiceTarget::None,
-                Some("ExternalName") => match &spec.external_name {
-                    None => ServiceTarget::None,
-                    Some(name) => ServiceTarget::Name(name.clone()),
-                },
-                Some("ClusterIP") | Some("NodePort") | Some("LoadBalancer") => {
-                    match &spec.cluster_ips {
-                        None => ServiceTarget::None,
-                        Some(ips) => {
-                            if ips.iter().map(|s| s.as_str()).contains(&"None") {
-                                ServiceTarget::Headless
-                            } else {
-                                ServiceTarget::ClusterIPs(
-                                    ips.iter().filter_map(|ip| ip.parse().ok()).collect(),
-                                )
-                            }
-                        }
-                    }
-                }
-                _ => ServiceTarget::None,
-            }
-        } else {
-            ServiceTarget::None
-        };
-
-        Ok(Self {
-            target,
-            ports: svc
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.ports.as_ref())
-                .map(|ports| {
-                    ports
-                        .iter()
-                        .filter(|p| is_tcp(&p.protocol))
-                        .map(|p| (p.port as u16, p.name.clone().unwrap_or_default()))
-                        .collect()
-                })
-                .unwrap_or_default(), // empty map if no ports
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -579,112 +844,10 @@ impl std::fmt::Display for ObjectKey {
     }
 }
 
-#[derive(serde::Serialize)]
-struct EndpointSlice {
-    target_ports: Map<String, u16>,
-    endpoints: Set<(String, IpAddr)>,
-}
-impl EndpointSlice {
-    fn for_service<'a>(
-        service_key: &ObjectKey,
-        ep_slices: &'a Map<EndpointSliceKey, Self>,
-    ) -> Vec<(&'a EndpointSliceKey, &'a Self)> {
-        let key_min = EndpointSliceKey {
-            namespace: service_key.namespace.clone(),
-            service_name: service_key.name.clone(),
-            name: String::new(),
-        };
-
-        use std::ops::Bound;
-
-        ep_slices
-            .range((Bound::Included(key_min), Bound::Unbounded))
-            .take_while(|(k, _)| k.is_service(service_key))
-            .collect()
-    }
-}
-impl KeyValueFrom<discovery::EndpointSlice> for EndpointSlice {
-    type Key = EndpointSliceKey;
-    type Error = &'static str;
-
-    fn key_from(eps: &discovery::EndpointSlice) -> Result<Self::Key, Self::Error> {
-        Ok(EndpointSliceKey {
-            namespace: eps.metadata.namespace.clone().ok_or("no namespace")?,
-            service_name: eps
-                .metadata
-                .owner_references
-                .as_ref()
-                .ok_or("no owners")?
-                .first()
-                .ok_or("empty owners")?
-                .name
-                .clone(),
-            name: eps.metadata.name.clone().ok_or("no name")?,
-        })
-    }
-
-    fn value_from(eps: &discovery::EndpointSlice) -> Result<Self, Self::Error> {
-        Ok(Self {
-            target_ports: eps
-                .ports
-                .as_ref()
-                .map(|ports| {
-                    ports
-                        .iter()
-                        .filter(|p| is_tcp(&p.protocol))
-                        .filter_map(|p| {
-                            let Some(port) = p.port else {
-                                return None;
-                            };
-                            let name = p.name.clone().unwrap_or_default();
-                            Some((name, port as u16))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-
-            endpoints: eps
-                .endpoints
-                .iter()
-                .filter(|ep| {
-                    // TODO topology, that requires a node context to know where we are
-                    ep.conditions.as_ref().is_some_and(|c| match c.ready {
-                        // None means unknown state, and should be interpreted as ready
-                        // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.29/#endpointconditions-v1-discovery-k8s-io
-                        Some(true) | None => true,
-                        Some(false) => false,
-                    })
-                })
-                .filter_map(|ep| {
-                    let Some(pod_name) = ep.target_ref.as_ref().and_then(|t| t.name.clone()) else {
-                        return None;
-                    };
-                    ep.addresses
-                        .iter()
-                        .filter_map(|addr| addr.parse().ok())
-                        .next()
-                        .map(|addr| (pod_name, addr))
-                })
-                .collect(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-struct EndpointSliceKey {
-    namespace: String,
-    service_name: String,
-    name: String,
-}
-impl EndpointSliceKey {
-    fn is_service(&self, key: &ObjectKey) -> bool {
-        self.namespace == key.namespace && self.service_name == key.name
-    }
-}
-
 #[derive(Debug, serde::Serialize)]
 struct Ingress {
     rules: Vec<IngressRule>,
+    endpoint_opts: EndpointOptions,
 }
 impl KeyValueFrom<networking::Ingress> for Ingress {
     type Key = ObjectKey;
@@ -706,7 +869,22 @@ impl KeyValueFrom<networking::Ingress> for Ingress {
             },
         );
 
-        Ok(Self { rules })
+        let get_opt = |k: &str| -> Option<&str> {
+            let ann = ing.metadata.annotations.as_ref()?;
+            let v = ann
+                .get(&format!("ingress.kubernetes.io/{k}"))
+                .or_else(|| ann.get(&format!("nginx.ingress.kubernetes.io/{k}")))?;
+            Some(v.as_str())
+        };
+
+        Ok(Self {
+            rules,
+            endpoint_opts: EndpointOptions {
+                secure_backends: get_opt("secure-backends") == Some("true"),
+                ssl_redirect: get_opt("secure-backends") == Some("true"),
+                http2: get_opt("http2") == Some("true"),
+            },
+        })
     }
 }
 
@@ -775,49 +953,23 @@ impl IngressMatch {
         })
     }
 
-    fn endpoints(
-        &self,
-        namespace: &String,
-        services: &Map<ObjectKey, Service>,
-        ep_slices: &Map<EndpointSliceKey, EndpointSlice>,
-    ) -> Set<Endpoint> {
-        let mut endpoints = Set::new();
-
+    fn endpoint(&self, namespace: &str, opts: EndpointOptions) -> Option<Endpoint> {
         let Some(backend) = self.backend.as_ref() else {
-            return endpoints;
+            return None;
         };
 
-        let service_key = ObjectKey {
-            namespace: namespace.clone(),
-            name: backend.service.clone(),
+        let name = &backend.service;
+
+        let port = match &backend.port {
+            PortRef::Name(_) => return None, // TODO
+            PortRef::Number(n) => *n,
         };
 
-        let Some(service) = services.get(&service_key) else {
-            return endpoints;
-        };
-
-        let port_name = match &backend.port {
-            PortRef::Name(n) => Some(n),
-            PortRef::Number(n) => service.ports.get(&n),
-        };
-        let Some(port_name) = port_name else {
-            return endpoints;
-        };
-
-        for (_, slice) in EndpointSlice::for_service(&service_key, &ep_slices) {
-            let Some(port) = slice.target_ports.get(port_name) else {
-                continue;
-            };
-
-            for (_, addr) in &slice.endpoints {
-                endpoints.insert(Endpoint {
-                    ip: addr.clone(),
-                    port: port.clone(),
-                });
-            }
-        }
-
-        endpoints
+        Some(Endpoint {
+            host: format!("{name}.{namespace}.svc"),
+            port,
+            opts,
+        })
     }
 }
 

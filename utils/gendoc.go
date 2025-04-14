@@ -1,16 +1,14 @@
 package main
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"text/template"
-
-	"github.com/mcluseau/kingress/config"
 )
 
-var funcMap template.FuncMap = map[string]interface{}{
+var funcMap template.FuncMap = map[string]any{
 	"sh": func(script string) string {
 		cmd := exec.Command("bash", "-c", script)
 		bytes, err := cmd.CombinedOutput()
@@ -24,7 +22,7 @@ var funcMap template.FuncMap = map[string]interface{}{
 }
 
 func main() {
-	tmplBytes, err := ioutil.ReadAll(os.Stdin)
+	tmplBytes, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -33,7 +31,5 @@ func main() {
 		Funcs(funcMap).
 		Parse(string(tmplBytes)))
 
-	tmpl.Execute(os.Stdout, map[string]interface{}{
-		"annotations": config.Annotations,
-	})
+	tmpl.Execute(os.Stdout, map[string]any{})
 }
