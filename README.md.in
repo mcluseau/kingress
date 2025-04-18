@@ -35,5 +35,5 @@ The following annotations are supported:
 ## Command line flags
 
 ```
-{{ sh "./kingress -h" }}
+{{ sh "./kingress --help" }}
 ```

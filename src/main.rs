@@ -1,7 +1,6 @@
 use clap::Parser;
 use eyre::{format_err, Result};
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
 use k8s_openapi::{
     api::{core::v1 as core, networking::v1 as networking},
     apimachinery::pkg::apis::meta::v1 as meta,
@@ -9,31 +8,77 @@ use k8s_openapi::{
 use kube::{api::Api, runtime::watcher, Client};
 use log::{debug, error, info, trace, warn};
 use openssl::ssl;
-use std::collections::BTreeMap as Map;
-use std::io::Write;
-use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
-use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net;
-use tokio::{sync::watch, time::Duration};
+use std::{
+    collections::BTreeMap as Map,
+    io::Write,
+    net::SocketAddr,
+    num::NonZero,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net,
+    sync::{watch, Mutex},
+};
+
+use kingress::*;
 
 const LEGACY_XFORWARDED: bool = true;
+
+/// resolved endpoints are cache 5s, like the default seen in CoreDNS for instance.
+const RESOLVE_CACHE_EXPIRY: Duration = Duration::from_secs(5);
+const RESOLVE_CACHE_NEGATIVE_EXPIRY: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Kubernetes namespace to watch. All namespaces are watched if not set.
     #[arg(short = 'n', long)]
     namespace: Option<String>,
+
+    /// Disable the kingress API to check internal state.
     #[arg(long)]
     no_api: bool,
-    #[arg(long, default_value = "[::]:80")]
-    http: SocketAddr,
-    #[arg(long, default_value = "[::]:443")]
-    https: SocketAddr,
+    /// API server bind address
     #[arg(long, default_value = "[::1]:2287")]
     api: SocketAddr,
+
+    /// HTTP server bind address
+    #[arg(long, default_value = "[::]:80")]
+    http: SocketAddr,
+    /// HTTPS server bind address
+    #[arg(long, default_value = "[::]:443")]
+    https: SocketAddr,
+
+    /// Method to resolve service endpoints
+    #[arg(long, default_value = "kube")]
+    resolver: Resolver,
+    /// Size of the resolver cache. 0 disables caching.
+    #[arg(long, default_value = "256")]
+    resolver_cache_size: usize,
+
+    /// DNS suffix used by the dns-host resolver to form service FQDNs. If not set, rely on resolv.conf.
     #[arg(long)]
     cluster_domain: Option<String>,
+
+    /// Zone used by the kube resolver to filter endpoints, if set.
+    #[arg(long)]
+    kube_zone: Option<String>,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum Resolver {
+    /// make DNS A queries
+    DnsHost,
+    /// ask kube-apiserver
+    Kube,
+}
+impl std::fmt::Display for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let v = clap::ValueEnum::to_possible_value(self);
+        f.write_str(v.as_ref().map_or("<?>", |p| p.get_name()))
+    }
 }
 
 #[tokio::main]
@@ -51,11 +96,23 @@ async fn main() -> eyre::Result<()> {
     };
 
     let client: Client = kube::Config::infer().await?.try_into()?;
-    let (mut watcher, hosts_rx) = KubeWatcher::new(client, cli.namespace);
+    let (mut watcher, hosts_rx) = KubeWatcher::new(client.clone(), cli.namespace);
+
+    info!("using endpoint resolver {}", cli.resolver);
 
     let cfg = Config {
-        cluster_domain: cli.cluster_domain.map_or("", |s| s.leak()),
         hosts: hosts_rx,
+        resolver: match cli.resolver {
+            Resolver::DnsHost => resolvers::Resolver::DnsHost {
+                dns_suffix: cli.cluster_domain,
+            },
+            Resolver::Kube => resolvers::Resolver::Kube {
+                client: client.clone(),
+                zone: cli.kube_zone,
+            },
+        },
+        resolve_cache: NonZero::new(cli.resolver_cache_size)
+            .map(|s| Mutex::new(lru::LruCache::new(s))),
     };
     if !CONFIG.set(cfg).is_ok() {
         panic!("config already set");
@@ -90,14 +147,110 @@ fn cfg() -> &'static Config {
     CONFIG.get().expect("config accessed before initialization")
 }
 
-#[derive(Clone)]
 struct Config {
-    cluster_domain: &'static str,
     hosts: HostsReceiver,
+    resolver: resolvers::Resolver,
+    resolve_cache: Option<Mutex<lru::LruCache<String, Arc<Mutex<Option<ResolveResult>>>>>>,
+}
+impl Config {
+    fn host(&self, name: &str) -> Option<Arc<HostConfig>> {
+        self.hosts.borrow().get(name).cloned()
+    }
+
+    async fn resolve(&self, ep: &Endpoint) -> Vec<SocketAddr> {
+        let Some(ref resolve_cache) = self.resolve_cache else {
+            return self.resolve_no_cache(ep).await.result();
+        };
+
+        let key = ep.to_string();
+
+        let cache_entry = (resolve_cache.lock().await)
+            .get_or_insert(key, || Arc::new(Mutex::new(None)))
+            .clone();
+
+        let mut cache_entry = cache_entry.lock().await;
+
+        if let Some(result) = cache_entry.as_ref() {
+            if result.expired() {
+                trace!("cached result expired: {result:?}");
+            } else {
+                trace!("using cached result: {result:?}");
+                return result.result();
+            }
+        }
+
+        let result = self.resolve_no_cache(ep).await;
+        let ret = result.result();
+
+        // cache the result
+        debug!("caching result: {ep} -> {result:?}");
+        *cache_entry = Some(result);
+
+        ret
+    }
+
+    async fn resolve_no_cache(&self, ep: &Endpoint) -> ResolveResult {
+        let result = self.resolver.resolve(ep).await;
+
+        if let Err(ref e) = result {
+            warn!("failed to resolve {ep}: {e}");
+        }
+
+        ResolveResult::new(result)
+    }
 }
 
 type HostsReceiver = watch::Receiver<Arc<Hosts>>;
 type Hosts = Map<String, Arc<HostConfig>>;
+
+enum ResolveResult {
+    Ok(Instant, Vec<SocketAddr>),
+    Failed(Instant),
+}
+impl ResolveResult {
+    fn new(result: Result<Vec<SocketAddr>>) -> Self {
+        let now = Instant::now();
+        match result {
+            Ok(v) => Self::Ok(now, v.clone()),
+            Err(_) => Self::Failed(now),
+        }
+    }
+
+    fn cached_at(&self) -> Instant {
+        match self {
+            Self::Ok(cached_at, _) => *cached_at,
+            Self::Failed(cached_at) => *cached_at,
+        }
+    }
+
+    fn age(&self) -> Duration {
+        Instant::now() - self.cached_at()
+    }
+
+    fn expired(&self) -> bool {
+        self.age()
+            > match self {
+                Self::Ok(_, _) => RESOLVE_CACHE_EXPIRY,
+                Self::Failed(_) => RESOLVE_CACHE_NEGATIVE_EXPIRY,
+            }
+    }
+
+    fn result(&self) -> Vec<SocketAddr> {
+        match self {
+            Self::Ok(_, v) => v.clone(),
+            Self::Failed(_) => vec![],
+        }
+    }
+}
+impl std::fmt::Debug for ResolveResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let age = self.age().as_millis();
+        match self {
+            Self::Ok(_, v) => write!(f, "Ok({age}ms ago, {v:?})"),
+            Self::Failed(_) => write!(f, "Failed({age}ms ago)"),
+        }
+    }
+}
 
 async fn http_server(bind: SocketAddr) {
     info!("starting HTTP on {bind}");
@@ -154,7 +307,7 @@ async fn https_server(bind: SocketAddr) {
                 // SNI is required -> servername is always set
                 let server_name = stream.ssl().servername(ssl::NameType::HOST_NAME).unwrap();
 
-                let Some(host_cfg) = get_host_cfg(server_name) else {
+                let Some(host_cfg) = cfg().host(server_name) else {
                     error!("{remote}: host {server_name} vanished");
                     return;
                 };
@@ -194,7 +347,7 @@ fn build_ssl_server_context() -> ssl::SslContext {
             return Err(SniError::ALERT_FATAL);
         };
 
-        let Some(host_cfg) = get_host_cfg(server_name) else {
+        let Some(host_cfg) = cfg().host(server_name) else {
             debug!("unknown host: {server_name}");
             return Err(SniError::ALERT_FATAL);
         };
@@ -215,7 +368,7 @@ fn build_ssl_server_context() -> ssl::SslContext {
         let Some(server_name) = ssl.servername(NameType::HOST_NAME) else {
             return Err(AlpnError::ALERT_FATAL);
         };
-        let Some(host_cfg) = get_host_cfg(server_name) else {
+        let Some(host_cfg) = cfg().host(server_name) else {
             return Err(AlpnError::ALERT_FATAL);
         };
 
@@ -289,8 +442,7 @@ where
 
     let req_path = full_req_path
         .split_once('?')
-        .map(|(p, _)| p)
-        .unwrap_or(full_req_path);
+        .map_or(full_req_path, |(p, _)| p);
 
     let mut host_line = String::new();
     match (&mut read).take(512).read_line(&mut host_line).await {
@@ -321,7 +473,7 @@ where
     };
     // */
 
-    let Some(host_cfg) = get_host_cfg(host) else {
+    let Some(host_cfg) = cfg().host(host) else {
         reply!("404 Not Found", "Unknown host");
     };
 
@@ -388,20 +540,11 @@ enum BackendError {
 async fn connect_to_backend(
     endpoint: &Endpoint,
 ) -> std::result::Result<(net::TcpStream, SocketAddr), BackendError> {
-    let cluster_domain = cfg().cluster_domain;
+    let mut backends = cfg().resolve(endpoint).await;
 
-    let full_host = if cluster_domain.is_empty() {
-        endpoint.to_string()
-    } else {
-        format!("{}.{cluster_domain}.:{}", endpoint.host, endpoint.port)
-    };
-
-    let backends = (net::lookup_host(&full_host).await)
-        .map_err(|e| {
-            warn!("failed to lookup {full_host}: {e}");
-            BackendError::LookupFailed
-        })?
-        .collect_vec();
+    if backends.is_empty() {
+        return Err(BackendError::LookupFailed);
+    }
 
     let backend_addr = match backends.len() {
         0 => return Err(BackendError::LookupFailed),
@@ -409,12 +552,18 @@ async fn connect_to_backend(
         n => backends[fastrand::usize(..n)],
     };
 
-    let stream = net::TcpStream::connect(backend_addr).await.map_err(|e| {
-        warn!("failed to connect to {backend_addr}: {e}");
-        BackendError::ConnectFailed
-    })?;
+    fastrand::shuffle(&mut backends);
 
-    Ok((stream, backend_addr))
+    for backend in backends {
+        let Ok(stream) = (net::TcpStream::connect(backend).await)
+            .inspect_err(|e| warn!("{endpoint}: failed to connect to {backend_addr}: {e}"))
+        else {
+            continue;
+        };
+        return Ok((stream, backend_addr));
+    }
+
+    Err(BackendError::ConnectFailed)
 }
 
 async fn connect_tls(
@@ -571,10 +720,6 @@ impl KubeWatcher {
     }
 }
 
-fn get_host_cfg(name: &str) -> Option<Arc<HostConfig>> {
-    cfg().hosts.borrow().get(&name.to_lowercase()).cloned()
-}
-
 type Stream<T> =
     std::pin::Pin<Box<dyn futures::Stream<Item = watcher::Result<watcher::Event<T>>> + Send>>;
 
@@ -707,17 +852,6 @@ impl CertifiedKey {
     }
 }
 
-#[allow(unused)]
-fn dump_json<T>(v: &T)
-where
-    T: serde::Serialize,
-{
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    serde_json::to_writer_pretty(&out, v).unwrap();
-    out.write(b"\n").unwrap();
-}
-
 #[derive(Clone, serde::Serialize)]
 struct HostConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,25 +901,6 @@ impl HostConfig {
             self.any_match.clone()
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-struct Endpoint {
-    host: String,
-    port: u16,
-    opts: EndpointOptions,
-}
-impl std::fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.host, self.port)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-struct EndpointOptions {
-    secure_backends: bool,
-    ssl_redirect: bool,
-    http2: bool,
 }
 
 fn ingest_event<T: KeyValueFrom<V>, V>(map: &mut Map<T::Key, T>, event: watcher::Event<V>) -> bool {
@@ -906,12 +1021,9 @@ impl IngressRule {
                     .find(|tls| tls.hosts.as_ref().is_some_and(|hosts| hosts.contains(host)))
                     .and_then(|tls| tls.secret_name.clone())
             }),
-            matches: rule
-                .http
-                .as_ref()
+            matches: (rule.http.as_ref())
                 .map(|http| {
-                    http.paths
-                        .iter()
+                    (http.paths.iter())
                         .filter_map(|path| IngressMatch::from_http_path(&path, spec))
                         .collect()
                 })
@@ -958,16 +1070,10 @@ impl IngressMatch {
             return None;
         };
 
-        let name = &backend.service;
-
-        let port = match &backend.port {
-            PortRef::Name(_) => return None, // TODO
-            PortRef::Number(n) => *n,
-        };
-
         Some(Endpoint {
-            host: format!("{name}.{namespace}.svc"),
-            port,
+            namespace: namespace.into(),
+            service: backend.service.clone(),
+            port: backend.port.clone(),
             opts,
         })
     }
@@ -998,12 +1104,6 @@ impl IngressBackend {
             port,
         })
     }
-}
-
-#[derive(Debug, serde::Serialize)]
-enum PortRef {
-    Number(u16),
-    Name(String),
 }
 
 #[derive(Debug, serde::Serialize)]

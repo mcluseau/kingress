@@ -35,17 +35,55 @@ The following annotations are supported:
 ## Command line flags
 
 ```
-$ target/debug/kingress -h
+$ ./kingress --help
 Usage: kingress [OPTIONS]
 
 Options:
-  -n, --namespace <NAMESPACE>            
-      --no-api                           
-      --http <HTTP>                      [default: [::]:80]
-      --https <HTTPS>                    [default: [::]:443]
-      --api <API>                        [default: [::1]:2287]
-      --cluster-domain <CLUSTER_DOMAIN>  
-  -h, --help                             Print help
-  -V, --version                          Print version
+  -n, --namespace <NAMESPACE>
+          Kubernetes namespace to watch. All namespaces are watched if not set
+
+      --no-api
+          Disable the kingress API to check internal state
+
+      --api <API>
+          API server bind address
+          
+          [default: [::1]:2287]
+
+      --http <HTTP>
+          HTTP server bind address
+          
+          [default: [::]:80]
+
+      --https <HTTPS>
+          HTTPS server bind address
+          
+          [default: [::]:443]
+
+      --resolver <RESOLVER>
+          Method to resolve service endpoints
+          
+          [default: kube]
+
+          Possible values:
+          - dns-host: make DNS A queries
+          - kube:     ask kube-apiserver
+
+      --resolver-cache-size <RESOLVER_CACHE_SIZE>
+          Size of the resolver cache. 0 disables caching
+          
+          [default: 256]
+
+      --cluster-domain <CLUSTER_DOMAIN>
+          DNS suffix used by the dns-host resolver to form service FQDNs. If not set, rely on resolv.conf
+
+      --kube-zone <KUBE_ZONE>
+          Zone used by the kube resolver to filter endpoints, if set
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 
 ```
