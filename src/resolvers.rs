@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use crate::Endpoint;
 
+pub mod cache;
 pub mod dns;
 pub mod kube;
 

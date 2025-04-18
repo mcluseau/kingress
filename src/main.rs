@@ -12,23 +12,18 @@ use std::{
     collections::BTreeMap as Map,
     io::Write,
     net::SocketAddr,
-    num::NonZero,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net,
-    sync::{watch, Mutex},
+    sync::watch,
 };
 
 use kingress::*;
 
 const LEGACY_XFORWARDED: bool = true;
-
-/// resolved endpoints are cache 5s, like the default seen in CoreDNS for instance.
-const RESOLVE_CACHE_EXPIRY: Duration = Duration::from_secs(5);
-const RESOLVE_CACHE_NEGATIVE_EXPIRY: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -57,6 +52,12 @@ struct Cli {
     /// Size of the resolver cache. 0 disables caching.
     #[arg(long, default_value = "256")]
     resolver_cache_size: usize,
+    /// Resolutions expiration delay in seconds.
+    #[arg(long, default_value = "5")]
+    resolver_cache_expiry: u64,
+    /// Failed resolutions expiration delay in seconds.
+    #[arg(long, default_value = "1")]
+    resolver_cache_negative_expiry: u64,
 
     /// DNS suffix used by the dns-host resolver to form service FQDNs. If not set, rely on resolv.conf.
     #[arg(long)]
@@ -100,8 +101,10 @@ async fn main() -> eyre::Result<()> {
 
     info!("using endpoint resolver {}", cli.resolver);
 
-    let cfg = Config {
-        hosts: hosts_rx,
+    let resolver = resolvers::cache::Builder {
+        size: cli.resolver_cache_size,
+        expiry_secs: cli.resolver_cache_expiry,
+        negative_expiry_secs: cli.resolver_cache_negative_expiry,
         resolver: match cli.resolver {
             Resolver::DnsHost => resolvers::Resolver::DnsHost {
                 dns_suffix: cli.cluster_domain,
@@ -111,8 +114,12 @@ async fn main() -> eyre::Result<()> {
                 zone: cli.kube_zone,
             },
         },
-        resolve_cache: NonZero::new(cli.resolver_cache_size)
-            .map(|s| Mutex::new(lru::LruCache::new(s))),
+    }
+    .build();
+
+    let cfg = Config {
+        hosts: hosts_rx,
+        resolver,
     };
     if !CONFIG.set(cfg).is_ok() {
         panic!("config already set");
@@ -149,8 +156,7 @@ fn cfg() -> &'static Config {
 
 struct Config {
     hosts: HostsReceiver,
-    resolver: resolvers::Resolver,
-    resolve_cache: Option<Mutex<lru::LruCache<String, Arc<Mutex<Option<ResolveResult>>>>>>,
+    resolver: resolvers::cache::Cache,
 }
 impl Config {
     fn host(&self, name: &str) -> Option<Arc<HostConfig>> {
@@ -158,99 +164,12 @@ impl Config {
     }
 
     async fn resolve(&self, ep: &Endpoint) -> Vec<SocketAddr> {
-        let Some(ref resolve_cache) = self.resolve_cache else {
-            return self.resolve_no_cache(ep).await.result();
-        };
-
-        let key = ep.to_string();
-
-        let cache_entry = (resolve_cache.lock().await)
-            .get_or_insert(key, || Arc::new(Mutex::new(None)))
-            .clone();
-
-        let mut cache_entry = cache_entry.lock().await;
-
-        if let Some(result) = cache_entry.as_ref() {
-            if result.expired() {
-                trace!("cached result expired: {result:?}");
-            } else {
-                trace!("using cached result: {result:?}");
-                return result.result();
-            }
-        }
-
-        let result = self.resolve_no_cache(ep).await;
-        let ret = result.result();
-
-        // cache the result
-        debug!("caching result: {ep} -> {result:?}");
-        *cache_entry = Some(result);
-
-        ret
-    }
-
-    async fn resolve_no_cache(&self, ep: &Endpoint) -> ResolveResult {
-        let result = self.resolver.resolve(ep).await;
-
-        if let Err(ref e) = result {
-            warn!("failed to resolve {ep}: {e}");
-        }
-
-        ResolveResult::new(result)
+        self.resolver.resolve(ep).await
     }
 }
 
 type HostsReceiver = watch::Receiver<Arc<Hosts>>;
 type Hosts = Map<String, Arc<HostConfig>>;
-
-enum ResolveResult {
-    Ok(Instant, Vec<SocketAddr>),
-    Failed(Instant),
-}
-impl ResolveResult {
-    fn new(result: Result<Vec<SocketAddr>>) -> Self {
-        let now = Instant::now();
-        match result {
-            Ok(v) => Self::Ok(now, v.clone()),
-            Err(_) => Self::Failed(now),
-        }
-    }
-
-    fn cached_at(&self) -> Instant {
-        match self {
-            Self::Ok(cached_at, _) => *cached_at,
-            Self::Failed(cached_at) => *cached_at,
-        }
-    }
-
-    fn age(&self) -> Duration {
-        Instant::now() - self.cached_at()
-    }
-
-    fn expired(&self) -> bool {
-        self.age()
-            > match self {
-                Self::Ok(_, _) => RESOLVE_CACHE_EXPIRY,
-                Self::Failed(_) => RESOLVE_CACHE_NEGATIVE_EXPIRY,
-            }
-    }
-
-    fn result(&self) -> Vec<SocketAddr> {
-        match self {
-            Self::Ok(_, v) => v.clone(),
-            Self::Failed(_) => vec![],
-        }
-    }
-}
-impl std::fmt::Debug for ResolveResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        let age = self.age().as_millis();
-        match self {
-            Self::Ok(_, v) => write!(f, "Ok({age}ms ago, {v:?})"),
-            Self::Failed(_) => write!(f, "Failed({age}ms ago)"),
-        }
-    }
-}
 
 async fn http_server(bind: SocketAddr) {
     info!("starting HTTP on {bind}");

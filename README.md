@@ -74,6 +74,16 @@ Options:
           
           [default: 256]
 
+      --resolver-cache-expiry <RESOLVER_CACHE_EXPIRY>
+          Resolutions expiration delay in seconds
+          
+          [default: 5]
+
+      --resolver-cache-negative-expiry <RESOLVER_CACHE_NEGATIVE_EXPIRY>
+          Failed resolutions expiration delay in seconds
+          
+          [default: 1]
+
       --cluster-domain <CLUSTER_DOMAIN>
           DNS suffix used by the dns-host resolver to form service FQDNs. If not set, rely on resolv.conf
 
