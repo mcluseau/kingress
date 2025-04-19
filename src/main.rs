@@ -1,22 +1,19 @@
 use clap::Parser;
 use eyre::{format_err, Result};
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::{
-    api::{core::v1 as core, networking::v1 as networking},
-    apimachinery::pkg::apis::meta::v1 as meta,
-};
+use k8s_openapi::api::{core::v1 as core, networking::v1 as networking};
 use kube::{api::Api, runtime::watcher, Client};
 use log::{debug, error, info, trace, warn};
 use openssl::ssl;
 use std::{
     collections::BTreeMap as Map,
-    io::Write,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::{
-    io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     net,
     sync::watch,
 };
@@ -117,11 +114,11 @@ async fn main() -> eyre::Result<()> {
     }
     .build();
 
-    let cfg = Config {
+    let ctx = Context {
         hosts: hosts_rx,
         resolver,
     };
-    if !CONFIG.set(cfg).is_ok() {
+    if !CTX.set(ctx).is_ok() {
         panic!("config already set");
     }
 
@@ -149,27 +146,10 @@ async fn main() -> eyre::Result<()> {
     std::process::exit(1);
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
-fn cfg() -> &'static Config {
-    CONFIG.get().expect("config accessed before initialization")
+static CTX: OnceLock<Context> = OnceLock::new();
+fn ctx() -> &'static Context {
+    CTX.get().expect("config accessed before initialization")
 }
-
-struct Config {
-    hosts: HostsReceiver,
-    resolver: resolvers::cache::Cache,
-}
-impl Config {
-    fn host(&self, name: &str) -> Option<Arc<HostConfig>> {
-        self.hosts.borrow().get(name).cloned()
-    }
-
-    async fn resolve(&self, ep: &Endpoint) -> Vec<SocketAddr> {
-        self.resolver.resolve(ep).await
-    }
-}
-
-type HostsReceiver = watch::Receiver<Arc<Hosts>>;
-type Hosts = Map<String, Arc<HostConfig>>;
 
 async fn http_server(bind: SocketAddr) {
     info!("starting HTTP on {bind}");
@@ -179,11 +159,7 @@ async fn http_server(bind: SocketAddr) {
     loop {
         let (sock, remote) = listener.accept().await.expect("HTTP listener failed");
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(sock, &remote, "http").await {
-                error!("{remote}: failed: {e}");
-            }
-        });
+        tokio::spawn(handle_http1_connection(sock, remote, "http"));
     }
 }
 
@@ -192,71 +168,40 @@ async fn https_server(bind: SocketAddr) {
 
     let listener = (net::TcpListener::bind(bind).await).expect("HTTPS failed to listen");
 
-    let ssl_ctx = build_ssl_server_context();
+    let ssl_ctx = build_server_ssl_context();
 
     loop {
         let (sock, remote) = listener.accept().await.expect("HTTPS listener failed");
 
-        let ssl_ctx = ssl_ctx.clone();
+        let ssl = ssl::Ssl::new(&ssl_ctx.clone())
+            .inspect_err(|e| error!("failed to setup SSL: {e}"))
+            .expect("SSL setup shouldn't fail");
 
-        tokio::spawn(async move {
-            let Ok(ssl) =
-                ssl::Ssl::new(&ssl_ctx).inspect_err(|e| error!("failed to setup SSL: {e}"))
-            else {
-                return;
-            };
-
-            let Ok(stream) = tokio_openssl::SslStream::new(ssl, sock)
-                .inspect_err(|e| info!("failed to create SSL stream: {e}"))
-            else {
-                return;
-            };
-
-            let mut stream = std::pin::pin!(stream);
-            if let Err(e) = stream.as_mut().accept().await {
-                debug!("{remote}: TLS not accepted: {e}");
-                return;
-            }
-
-            let proto = stream.ssl().selected_alpn_protocol();
-            if proto == Some(b"h2") {
-                // HTTP/2 conditions are met: ingress with a single any match
-                // This allows direct copy of the client/backend stream.
-
-                // SNI is required -> servername is always set
-                let server_name = stream.ssl().servername(ssl::NameType::HOST_NAME).unwrap();
-
-                let Some(host_cfg) = cfg().host(server_name) else {
-                    error!("{remote}: host {server_name} vanished");
-                    return;
-                };
-
-                let Some(ref endpoint) = host_cfg.any_match else {
-                    error!("{remote}: host {server_name} lost its \"*\" match");
-                    return;
-                };
-
-                let Ok((backend, backend_addr)) = connect_to_backend(endpoint).await else {
-                    return;
-                };
-                let Ok(backend) = connect_tls(backend, endpoint, b"\x02h2").await else {
-                    return;
-                };
-
-                if let Err(e) = forward_to_backend(Vec::new(), stream, backend).await {
-                    warn!("{remote}: forwarding to {backend_addr} failed: {e}");
-                }
-                return;
-            }
-
-            if let Err(e) = handle_connection(stream, &remote, "https").await {
-                error!("{remote}: failed: {e}");
-            }
-        });
+        tokio::spawn(handle_https_connection(sock, remote, ssl));
     }
 }
 
-fn build_ssl_server_context() -> ssl::SslContext {
+async fn handle_https_connection(sock: net::TcpStream, remote: SocketAddr, ssl: ssl::Ssl) {
+    let Ok(mut stream) = tokio_openssl::SslStream::new(ssl, sock)
+        .inspect_err(|e| info!("failed to create SSL stream: {e}"))
+    else {
+        return;
+    };
+
+    if let Err(e) = Pin::new(&mut stream).accept().await {
+        debug!("{remote}: TLS not accepted: {e}");
+        return;
+    }
+
+    match stream.ssl().selected_alpn_protocol() {
+        // HTTP/2
+        Some(b"h2") => handle_http2_connection(stream, remote).await,
+        // HTTP/1.x by default
+        _ => handle_http1_connection(stream, remote, "https").await,
+    }
+}
+
+fn build_server_ssl_context() -> ssl::SslContext {
     use ssl::{AlpnError, NameType, SniError, SslContextBuilder, SslMethod};
 
     let mut builder = SslContextBuilder::new(SslMethod::tls_server()).unwrap();
@@ -266,7 +211,7 @@ fn build_ssl_server_context() -> ssl::SslContext {
             return Err(SniError::ALERT_FATAL);
         };
 
-        let Some(host_cfg) = cfg().host(server_name) else {
+        let Some(host_cfg) = ctx().host(server_name) else {
             debug!("unknown host: {server_name}");
             return Err(SniError::ALERT_FATAL);
         };
@@ -287,7 +232,7 @@ fn build_ssl_server_context() -> ssl::SslContext {
         let Some(server_name) = ssl.servername(NameType::HOST_NAME) else {
             return Err(AlpnError::ALERT_FATAL);
         };
-        let Some(host_cfg) = cfg().host(server_name) else {
+        let Some(host_cfg) = ctx().host(server_name) else {
             return Err(AlpnError::ALERT_FATAL);
         };
 
@@ -319,24 +264,20 @@ macro_rules! http_response {
     };
 }
 
-async fn handle_connection<RW>(sock: RW, remote: &SocketAddr, forwarded_proto: &str) -> Result<()>
+mod http1;
+
+async fn handle_http1_connection<RW>(mut sock: RW, remote: SocketAddr, forwarded_proto: &str)
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut read = tokio::io::BufReader::with_capacity(4096, sock);
-
     macro_rules! reply {
         ($status:expr) => {{
-            let _ = (read.into_inner())
-                .write(&http_response($status, $status))
-                .await;
-            return Ok(());
+            let _ = sock.write(&http_response($status, $status)).await;
+            return;
         }};
         ($status:expr, $message:expr) => {{
-            let _ = (read.into_inner())
-                .write(&http_response($status, $message))
-                .await;
-            return Ok(());
+            let _ = sock.write(&http_response($status, $message)).await;
+            return;
         }};
     }
     macro_rules! reply_bad_request {
@@ -345,54 +286,53 @@ where
         };
     }
 
-    let mut get_line = String::new();
-    match (&mut read).take(8192).read_line(&mut get_line).await {
-        Ok(0) => reply!("414 URI Too Long"),
-        Ok(_) => {}
-        Err(e) => Err(e)?,
+    use http1::{Error, HeaderRead};
+
+    macro_rules! http1_result {
+        ($e:expr, $limit_error:expr) => {
+            match $e.await {
+                Ok(e) => e,
+                Err(Error::LimitReached) => reply!($limit_error),
+                Err(Error::InvalidInput) => reply_bad_request!("invalid input"),
+                Err(e) => {
+                    debug!("{remote}: {}", e);
+                    return;
+                }
+            }
+        };
     }
 
-    let Some((_method, full_req_path)) = get_line.trim_ascii_end().split_once(' ') else {
-        reply_bad_request!("invalid request line");
+    let mut read = tokio::io::BufReader::with_capacity(4096, &mut sock);
+    let mut reader = http1::Reader::new(&mut read, 16 << 10);
+
+    let req_line = http1_result!(reader.request_line(8192), "414 URI Too Long");
+
+    let Ok(full_req_path) = std::str::from_utf8(req_line.path()) else {
+        reply_bad_request!("invalid path");
     };
-    let Some((full_req_path, _proto)) = full_req_path.split_once(' ') else {
-        reply_bad_request!("invalid request line: no protocol");
-    };
+    let req_path = (full_req_path.find('?')).map_or(full_req_path, |i| &full_req_path[..i]);
 
-    let req_path = full_req_path
-        .split_once('?')
-        .map_or(full_req_path, |(p, _)| p);
-
-    let mut host_line = String::new();
-    match (&mut read).take(512).read_line(&mut host_line).await {
-        Ok(0) => reply!("413 Content Too Large"),
-        Ok(_) => {}
-        Err(e) => Err(e)?,
-    }
-
-    let Some((hdr_name, hdr_value)) = host_line.split_once(":") else {
-        reply_bad_request!("invalid header");
+    let header = http1_result!(reader.header(512), "413 Content Too Large");
+    let header = match header {
+        HeaderRead::Header(hdr) => hdr,
+        HeaderRead::EndOfHeader => reply_bad_request!("no Host header"),
     };
 
-    if !hdr_name.eq_ignore_ascii_case("host") {
+    if !header.name().eq_ignore_ascii_case(b"host") {
         reply_bad_request!("first header must be Host");
     }
 
-    let hdr_value = hdr_value.trim_ascii();
-    let host = hdr_value
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(hdr_value);
+    let Ok(host) = std::str::from_utf8(header.value()) else {
+        reply_bad_request!("invalid host");
+    };
+
+    let host = host.trim_ascii().to_lowercase();
+    let host = host.as_str();
+    let host = host.find(':').map_or(host, |i| &host[..i]);
 
     debug!("{remote}: requested {host} {req_path}");
 
-    /* TODO check readiness
-    let Some(cfg) = cfg else {
-        reply!("503 Service Unavailable");
-    };
-    // */
-
-    let Some(host_cfg) = cfg().host(host) else {
+    let Some(host_cfg) = ctx().host(host) else {
         reply!("404 Not Found", "Unknown host");
     };
 
@@ -404,14 +344,13 @@ where
 
     if endpoint.opts.ssl_redirect && forwarded_proto != "https" {
         let target_url = format!("https://{host}{full_req_path}");
-        let _ = read
-            .into_inner()
+        let _ = sock
             .write(
                 format!("HTTP/1.1 301 Moved Permanently\r\nLocation: {target_url}\r\n\r\n<a href=\"{target_url}\">Moved Permanently</a>.\n")
                     .as_bytes(),
             )
             .await;
-        return Ok(());
+        return;
     }
 
     let (backend, backend_addr) = match connect_to_backend(&endpoint).await {
@@ -420,24 +359,77 @@ where
         Err(BackendError::ConnectFailed) => reply!("502 Bad Gateway"),
     };
 
-    let mut initial_data = Vec::new();
-    initial_data.extend_from_slice(get_line.as_bytes());
-    initial_data.extend_from_slice(host_line.as_bytes());
-    write!(
-        initial_data,
-        "Forwarded: for=\"{remote}\";proto={forwarded_proto}\r\n"
-    )?;
+    let mut initial_data = http1::Writer::new();
+    initial_data.append(req_line.into_raw());
+    initial_data.append(header.into_raw());
+
+    initial_data.header(
+        "Forwarded",
+        &format!("for=\"{remote}\";proto={forwarded_proto};host={host}"),
+    );
     if LEGACY_XFORWARDED {
-        write!(
-            initial_data,
-            "X-Forwarded-For: {remote}\r\nX-Forwarded-Proto: {forwarded_proto}\r\n"
-        )?;
+        initial_data.header("X-Forwarded-For", &remote.to_string());
+        initial_data.header("X-Forwarded-Proto", forwarded_proto);
+        initial_data.header("X-Forwarded-Host", host);
     }
-    initial_data.extend_from_slice(read.buffer());
+
+    let can_keepalive = host_cfg.is_any_only();
+    let mut sent_connection_header = false;
+
+    loop {
+        let header = http1_result!(reader.header(4096), "413 Content Too Large");
+
+        use http1::HeaderRead::*;
+        match header {
+            Header(hdr) => {
+                if hdr.is(b"forwarded")
+                    || hdr.is(b"x-forwarded-for")
+                    || hdr.is(b"x-forwarded-proto")
+                    || hdr.is(b"x-forwarded-host")
+                {
+                    continue;
+                }
+
+                let value = hdr.value().trim_ascii();
+                if hdr.is(b"connection") {
+                    sent_connection_header = true;
+                    if b"keep-alive".eq_ignore_ascii_case(value) && !can_keepalive {
+                        // we can't guarantee that subsequent requests are going to the same endpoint
+                        initial_data.header("Connection", "close");
+                        continue;
+                    }
+                }
+
+                initial_data.append(hdr.into_raw());
+            }
+            EndOfHeader => {
+                break;
+            }
+        };
+    }
+
+    if !sent_connection_header && !can_keepalive {
+        initial_data.header("Connection", "close");
+    }
+    // TODO enforce "Connection: close" in the serveur response. For now we rely on endpoints
+    // respecting client's choice.
+
+    // finalize the header
+    initial_data.append_slice(b"\r\n");
+
+    // don't forget the data in the read buffer
+    initial_data.append_slice(read.buffer());
+
+    let initial_data = initial_data.into_bytes();
 
     let result = if endpoint.opts.secure_backends {
-        let backend = (connect_tls(backend, &endpoint, b"\x08http/1.1").await)
-            .map_err(|e| format_err!("{backend_addr}: tls failed: {e}"))?;
+        let backend = match connect_tls(backend, &endpoint, b"\x08http/1.1").await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("{backend_addr}: tls failed: {e}");
+                return;
+            }
+        };
 
         forward_to_backend(initial_data, read.into_inner(), backend).await
     } else {
@@ -447,7 +439,39 @@ where
     if let Err(e) = result {
         warn!("{remote}: forwarding to {backend_addr} failed: {e}");
     }
-    Ok(())
+}
+
+async fn handle_http2_connection(
+    stream: tokio_openssl::SslStream<net::TcpStream>,
+    remote: SocketAddr,
+) {
+    // HTTP/2 conditions are met: ingress with a single any match
+    // This allows direct copy of the client/backend stream.
+
+    // SNI is required -> servername is always set
+    let server_name =
+        (stream.ssl().servername(ssl::NameType::HOST_NAME)).expect("servername should be set");
+
+    let Some(host_cfg) = ctx().host(server_name) else {
+        error!("{remote}: host {server_name} vanished");
+        return;
+    };
+
+    let Some(ref endpoint) = host_cfg.any_match else {
+        error!("{remote}: host {server_name} lost its \"*\" match");
+        return;
+    };
+
+    let Ok((backend, backend_addr)) = connect_to_backend(endpoint).await else {
+        return;
+    };
+    let Ok(backend) = connect_tls(backend, endpoint, b"\x02h2").await else {
+        return;
+    };
+
+    if let Err(e) = forward_to_backend(Vec::new(), stream, backend).await {
+        warn!("{remote}: forwarding to {backend_addr} failed: {e}");
+    }
 }
 
 #[derive(Debug)]
@@ -459,7 +483,7 @@ enum BackendError {
 async fn connect_to_backend(
     endpoint: &Endpoint,
 ) -> std::result::Result<(net::TcpStream, SocketAddr), BackendError> {
-    let mut backends = cfg().resolve(endpoint).await;
+    let mut backends = ctx().resolve(endpoint).await;
 
     if backends.is_empty() {
         return Err(BackendError::LookupFailed);
@@ -491,7 +515,6 @@ async fn connect_tls(
     alpn_protos: &[u8],
 ) -> Result<tokio_openssl::SslStream<net::TcpStream>> {
     use ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
-    use std::pin::Pin;
 
     let mut ssl_ctx = SslContextBuilder::new(SslMethod::tls_client())?;
 
@@ -530,7 +553,7 @@ where
 
 async fn api_server(bind: impl Into<std::net::SocketAddr>) {
     use warp::Filter;
-    let server = warp::get().map(|| warp::reply::json(&cfg().hosts.borrow().clone()));
+    let server = warp::get().map(|| warp::reply::json(&ctx().hosts.borrow().clone()));
     warp::serve(server).try_bind(bind).await;
 }
 
@@ -639,8 +662,7 @@ impl KubeWatcher {
     }
 }
 
-type Stream<T> =
-    std::pin::Pin<Box<dyn futures::Stream<Item = watcher::Result<watcher::Event<T>>> + Send>>;
+type Stream<T> = Pin<Box<dyn futures::Stream<Item = watcher::Result<watcher::Event<T>>> + Send>>;
 
 struct WatcherStreams {
     ing: Stream<networking::Ingress>,
@@ -757,71 +779,6 @@ impl WatcherState {
     }
 }
 
-struct CertifiedKey {
-    key: openssl::pkey::PKey<openssl::pkey::Private>,
-    cert: openssl::x509::X509,
-}
-impl CertifiedKey {
-    fn from_pem(key_pem: &[u8], crt_pem: &[u8]) -> Result<Self> {
-        use openssl::{pkey::PKey, x509::X509};
-        Ok(Self {
-            key: PKey::private_key_from_pem(key_pem)?,
-            cert: X509::from_pem(crt_pem)?,
-        })
-    }
-}
-
-#[derive(Clone, serde::Serialize)]
-struct HostConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tls_secret: Option<ObjectKey>,
-    #[serde(skip_serializing_if = "Map::is_empty")]
-    exact_matches: Map<String, Endpoint>,
-    #[serde(skip_serializing_if = "Map::is_empty")]
-    prefix_matches: Map<String, Endpoint>,
-    any_match: Option<Endpoint>,
-
-    #[serde(skip_serializing)]
-    tls_key_cert: Option<Arc<CertifiedKey>>,
-}
-impl Default for HostConfig {
-    fn default() -> Self {
-        Self {
-            tls_secret: None,
-            exact_matches: Map::new(),
-            prefix_matches: Map::new(),
-            any_match: None,
-            tls_key_cert: None,
-        }
-    }
-}
-impl HostConfig {
-    fn is_h2_ready(&self) -> bool {
-        if !(self.exact_matches.is_empty() && self.prefix_matches.is_empty()) {
-            return false;
-        }
-        let Some(any) = self.any_match.as_ref() else {
-            return false;
-        };
-        any.opts.secure_backends && any.opts.http2
-    }
-
-    fn endpoint_for(&self, path: &str) -> Option<Endpoint> {
-        if let Some(ep) = self.exact_matches.get(path) {
-            Some(ep.clone())
-        } else if let Some(ep) = self
-            .prefix_matches
-            .iter()
-            .rev()
-            .find_map(|(k, ep)| path.starts_with(k).then_some(ep))
-        {
-            Some(ep.clone())
-        } else {
-            self.any_match.clone()
-        }
-    }
-}
-
 fn ingest_event<T: KeyValueFrom<V>, V>(map: &mut Map<T::Key, T>, event: watcher::Event<V>) -> bool {
     use watcher::Event::*;
     match event {
@@ -856,26 +813,6 @@ trait KeyValueFrom<V>: Sized {
     type Error;
     fn key_from(v: &V) -> Result<Self::Key, Self::Error>;
     fn value_from(v: &V) -> Result<Self, Self::Error>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-struct ObjectKey {
-    namespace: String,
-    name: String,
-}
-impl TryFrom<&meta::ObjectMeta> for ObjectKey {
-    type Error = &'static str;
-    fn try_from(metadata: &meta::ObjectMeta) -> Result<Self, Self::Error> {
-        Ok(Self {
-            namespace: metadata.namespace.clone().ok_or("no namespace")?,
-            name: metadata.name.clone().ok_or("no name")?,
-        })
-    }
-}
-impl std::fmt::Display for ObjectKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}/{}", self.namespace, self.name)
-    }
 }
 
 #[derive(Debug, serde::Serialize)]
