@@ -5,7 +5,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+pub mod http1;
 pub mod resolvers;
+
+pub const ALPN_H1: &[u8] = b"\x08http/1.1";
+pub const ALPN_H2: &[u8] = b"\x02h2";
+pub const ALPN_H2_H1: &[u8] = b"\x02h2\x08http/1.1";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct Endpoint {
