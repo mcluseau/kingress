@@ -1,15 +1,87 @@
 use core::ops::Range;
 use std::str;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub mod response;
+pub mod status;
+
+#[cfg(test)]
+mod test;
+
+const METHODS_WITHOUT_BODY: &[&[u8]] =
+    &[b"GET", b"OPTIONS", b"HEAD", b"DELETE", b"CONNECT", b"TRACE"];
+
+struct HeaderSummary {
+    content_length: Option<u64>,
+    transfer_encoding_is_chunked: bool,
+    connection_is_close: bool,
+}
+impl HeaderSummary {
+    fn new() -> Self {
+        Self {
+            content_length: None,
+            transfer_encoding_is_chunked: false,
+            connection_is_close: false,
+        }
+    }
+
+    fn process_header(&mut self, name: &[u8], value: &[u8]) -> Result<()> {
+        if name.eq_ignore_ascii_case(b"Content-Length") {
+            let v = str::from_utf8(value).map_err(|_| Error::InvalidInput)?;
+            let v = v.parse().map_err(|_| Error::InvalidInput)?;
+            self.content_length = Some(v);
+        } else if name.eq_ignore_ascii_case(b"Transfer-Encoding") {
+            self.transfer_encoding_is_chunked = value.eq_ignore_ascii_case(b"chunked");
+        } else if name.eq_ignore_ascii_case(b"Connection") {
+            self.connection_is_close = value.eq_ignore_ascii_case(b"close");
+        }
+        Ok(())
+    }
+
+    fn request_length(&self, method: &[u8]) -> Option<u64> {
+        if self.transfer_encoding_is_chunked {
+            return None;
+        }
+        if let Some(length) = self.content_length {
+            return Some(length);
+        }
+
+        if (METHODS_WITHOUT_BODY.iter()).any(|&m| method.eq_ignore_ascii_case(m)) {
+            return Some(0);
+        }
+
+        if self.connection_is_close {
+            return None;
+        }
+        Some(0)
+    }
+
+    fn response_length(&self, status_code: u16) -> Option<u64> {
+        match status_code {
+            101 => return None, // switching protocols
+            100..=199 | 204 | 304 => return Some(0),
+            _ => {}
+        }
+        if self.transfer_encoding_is_chunked {
+            return None;
+        }
+        self.content_length
+    }
+}
+
+enum HeaderKind {
+    None,
+    Request { method: Vec<u8> },
+    Response { status_code: u16 },
+}
 
 pub struct Reader<'t, R> {
     reader: &'t mut R,
     limit: Option<usize>,
     count: usize,
 
-    pub content_length: Option<u64>,
+    kind: HeaderKind,
+    summary: HeaderSummary,
 }
 
 impl<'t, R: BytePeekRead> Reader<'t, R> {
@@ -18,11 +90,12 @@ impl<'t, R: BytePeekRead> Reader<'t, R> {
             reader,
             limit,
             count: 0,
-            content_length: None,
+            kind: HeaderKind::None,
+            summary: HeaderSummary::new(),
         }
     }
 
-    fn ranger(&mut self, limit: usize) -> Ranger<R> {
+    fn ranger<S: RangerStorage + Default>(&mut self, limit: usize) -> Ranger<R, S> {
         let limit = self.limit.map_or(limit, |global_limit| {
             limit.min(global_limit.checked_sub(self.count).unwrap_or(0))
         });
@@ -39,15 +112,13 @@ impl<'t, R: BytePeekRead> Reader<'t, R> {
         ];
         ranger.expect(b'\n').await?;
 
-        let raw = ranger.done();
-        self.count += raw.len();
+        let (raw, count) = ranger.done();
+        self.count += count;
 
         let rl = RequestLine(LineParts { raw, parts });
 
-        let method = rl.method();
-        if b"GET".eq_ignore_ascii_case(method) || b"HEAD".eq_ignore_ascii_case(method) {
-            self.content_length = Some(0);
-        }
+        let method = rl.method().to_vec();
+        self.kind = HeaderKind::Request { method };
 
         Ok(rl)
     }
@@ -55,19 +126,27 @@ impl<'t, R: BytePeekRead> Reader<'t, R> {
     pub async fn status_line(&mut self, limit: usize) -> Result<StatusLine> {
         let mut ranger = self.ranger(limit);
 
-        let parts: [Range<usize>; 2] = [
+        let parts: [Range<usize>; 3] = [
+            ranger.range_to_and_skip_sp(b' ').await?,
             ranger.range_to_and_skip_sp(b' ').await?,
             ranger.range_to(b'\r').await?,
         ];
         ranger.expect(b'\n').await?;
 
-        let raw = ranger.done();
-        self.count += raw.len();
-        Ok(StatusLine(LineParts { raw, parts }))
+        let (raw, count) = ranger.done();
+        self.count += count;
+
+        let sl = StatusLine(LineParts { raw, parts });
+
+        let status_code = str::from_utf8(sl.status_code()).map_err(|_| Error::InvalidInput)?;
+        let status_code = status_code.parse().map_err(|_| Error::InvalidInput)?;
+        self.kind = HeaderKind::Response { status_code };
+
+        Ok(sl)
     }
 
-    pub async fn header(&mut self, limit: usize) -> Result<HeaderRead> {
-        let mut ranger = self.ranger(limit);
+    pub async fn header_name(&mut self) -> Result<HeaderRead> {
+        let mut ranger = self.ranger::<Vec<u8>>(40);
 
         if ranger.peek().await? == b'\r' {
             ranger.read().await?;
@@ -77,32 +156,63 @@ impl<'t, R: BytePeekRead> Reader<'t, R> {
 
         let name = ranger.range_to_and_skip_sp(b':').await?;
 
+        let (mut raw, count) = ranger.done();
+        self.count += count;
+
+        raw.truncate(name.end);
+
+        Ok(HeaderRead::Name(raw))
+    }
+
+    pub async fn header_value(&mut self, name: &[u8], limit: usize) -> Result<Vec<u8>> {
+        let (raw, range) = self.read_header_value::<Vec<u8>>(limit).await?;
+        let value = &raw[range];
+
+        // parse some headers
+        self.summary.process_header(name, value)?;
+
+        Ok(value.into())
+    }
+
+    pub async fn skip_header_value(&mut self, limit: usize) -> Result<()> {
+        self.read_header_value::<Discard>(limit).await?;
+        Ok(())
+    }
+
+    async fn read_header_value<S: RangerStorage + Default>(
+        &mut self,
+        limit: usize,
+    ) -> Result<(S, Range<usize>)> {
+        let mut ranger = self.ranger(limit);
+
+        ranger.skip_sp().await?;
         ranger.start_range();
+
         let value = loop {
-            let r = ranger.to(b'\r').await?;
-            ranger.expect(b'\n').await?;
-            if !ranger.next_is_sp().await? {
-                break r;
+            while ranger.peek().await? != b'\r' {
+                ranger.read().await?;
             }
+            let r = ranger.range();
+            ranger.expect(b'\r').await?;
+            ranger.expect(b'\n').await?;
+            if ranger.next_is_sp().await? {
+                continue;
+            }
+            break r;
         };
 
-        let raw = ranger.done();
-        self.count += raw.len();
+        let (storage, count) = ranger.done();
+        self.count += count;
 
-        let hdr = Header(LineParts {
-            raw,
-            parts: [name, value],
-        });
+        Ok((storage, value))
+    }
 
-        // parse headers we care about
-        let name = hdr.name();
-        if b"Content-Length".eq_ignore_ascii_case(name) {
-            let s = str::from_utf8(hdr.value()).map_err(|_| Error::InvalidInput)?;
-            self.content_length = Some(s.parse().map_err(|_| Error::InvalidInput)?);
+    pub fn content_length(&self) -> Option<u64> {
+        match self.kind {
+            HeaderKind::None => None,
+            HeaderKind::Request { ref method } => self.summary.request_length(method),
+            HeaderKind::Response { status_code } => self.summary.response_length(status_code),
         }
-
-        // all good!
-        Ok(HeaderRead::Header(hdr))
     }
 }
 
@@ -137,10 +247,19 @@ impl Writer {
         self.append_slice(b"\r\n");
     }
 
-    pub fn header(&mut self, name: &str, value: &str) {
-        let name = name.as_bytes();
-        let value = value.as_bytes();
+    pub fn status(&mut self, status: &[u8]) {
+        const PREFIX: &[u8] = b"HTTP/1.1 ";
+        self.0.reserve(PREFIX.len() + status.len() + 2);
+        self.append_slice(PREFIX);
+        self.append_slice(status);
+        self.crlf();
+    }
 
+    pub fn header(&mut self, name: &str, value: &str) {
+        self.header_raw(name.as_bytes(), value.as_bytes())
+    }
+
+    pub fn header_raw(&mut self, name: &[u8], value: &[u8]) {
         self.0.reserve(name.len() + 2 + value.len() + 2);
 
         self.append_slice(name);
@@ -155,20 +274,31 @@ impl Writer {
         self.0.reserve(length);
         self.0
     }
+
+    pub fn content(self, content: String) -> Vec<u8> {
+        let mut content = content.into_bytes();
+        let mut ret = self.content_length(content.len());
+        ret.append(&mut content);
+        ret
+    }
 }
 
 #[allow(async_fn_in_trait)]
 pub trait BytePeekRead {
-    async fn read_byte(&mut self) -> std::io::Result<u8>;
-    async fn peek_byte(&mut self) -> std::io::Result<u8>;
+    async fn read_byte(&mut self) -> std::io::Result<Option<u8>>;
+    async fn peek_byte(&mut self) -> std::io::Result<Option<u8>>;
 }
 
 impl<R: AsyncRead + Unpin> BytePeekRead for BufReader<R> {
-    async fn read_byte(&mut self) -> std::io::Result<u8> {
-        self.read_u8().await
+    async fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
+        let r = self.peek_byte().await;
+        if let Ok(Some(_)) = r {
+            self.consume(1);
+        }
+        r
     }
-    async fn peek_byte(&mut self) -> std::io::Result<u8> {
-        self.fill_buf().await.map(|buf| buf[0])
+    async fn peek_byte(&mut self) -> std::io::Result<Option<u8>> {
+        self.fill_buf().await.map(|buf| buf.first().cloned())
     }
 }
 
@@ -199,27 +329,30 @@ impl<'t, R, W: AsyncWrite + Unpin> CopyingBytePeekRead<'t, BufReader<R>, W> {
 impl<'t, R: AsyncRead + Unpin, W: AsyncWrite + Unpin> BytePeekRead
     for CopyingBytePeekRead<'t, BufReader<R>, W>
 {
-    async fn read_byte(&mut self) -> std::io::Result<u8> {
-        let b = self.peek_byte().await?;
+    async fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
+        let Some(b) = self.peek_byte().await? else {
+            return Ok(None);
+        };
         self.reader.consume(1);
         self.read_buf.push(b);
-        Ok(b)
+        Ok(Some(b))
     }
 
-    async fn peek_byte(&mut self) -> std::io::Result<u8> {
+    async fn peek_byte(&mut self) -> std::io::Result<Option<u8>> {
         let b = {
             let buf = self.reader.buffer();
             if buf.is_empty() {
                 self.flush().await?;
-                self.reader.fill_buf().await?[0]
+                self.reader.fill_buf().await?.first()
             } else {
-                buf[0]
+                buf.first()
             }
         };
-        Ok(b)
+        Ok(b.cloned())
     }
 }
 
+#[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
     LimitReached,
@@ -242,44 +375,71 @@ impl std::fmt::Display for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-struct Ranger<'t, R> {
-    raw: Vec<u8>,
+trait RangerStorage {
+    fn push(&mut self, b: u8);
+}
+
+#[derive(Default)]
+struct Discard();
+impl RangerStorage for Discard {
+    fn push(&mut self, _b: u8) {}
+}
+
+impl RangerStorage for Vec<u8> {
+    fn push(&mut self, b: u8) {
+        Vec::push(self, b)
+    }
+}
+
+struct Ranger<'t, R, S> {
     reader: &'t mut R,
+    storage: S,
     limit: usize,
+    count: usize,
     start: usize,
 }
-impl<'t, R: BytePeekRead> Ranger<'t, R> {
+impl<'t, R: BytePeekRead, S: RangerStorage + Default> Ranger<'t, R, S> {
     fn new(reader: &'t mut R, limit: usize) -> Self {
         Self {
-            raw: Vec::with_capacity(limit.min(4096 /* page size */)),
             reader,
+            storage: Default::default(),
             limit,
+            count: 0,
             start: 0,
         }
     }
 
-    fn done(self) -> Vec<u8> {
-        self.raw
+    fn done(self) -> (S, usize) {
+        (self.storage, self.count)
     }
 
     async fn read(&mut self) -> Result<u8> {
-        if self.raw.len() == self.limit {
+        if self.count == self.limit {
             return Err(Error::LimitReached);
         }
-        let b = self.reader.read_byte().await?;
-        self.raw.push(b);
+        let Some(b) = self.reader.read_byte().await? else {
+            return Err(Error::InvalidInput);
+        };
+        self.storage.push(b);
+        self.count += 1;
         Ok(b)
     }
 
     async fn peek(&mut self) -> Result<u8> {
-        if self.raw.len() == self.limit {
+        if self.count == self.limit {
             return Err(Error::LimitReached);
         }
-        Ok(self.reader.peek_byte().await?)
+        let Some(b) = self.reader.peek_byte().await? else {
+            return Err(Error::InvalidInput);
+        };
+        Ok(b)
     }
 
     fn start_range(&mut self) {
-        self.start = self.raw.len();
+        self.start = self.count;
+    }
+    fn range(&self) -> Range<usize> {
+        self.start..self.count
     }
 
     async fn range_to(&mut self, search: u8) -> Result<Range<usize>> {
@@ -301,7 +461,7 @@ impl<'t, R: BytePeekRead> Ranger<'t, R> {
                 _ => {}
             }
         }
-        Ok(self.start..self.raw.len() - 1) // range without the separator
+        Ok(self.start..self.count - 1) // range without the separator
     }
 
     async fn expect(&mut self, expected: u8) -> Result<()> {
@@ -312,10 +472,7 @@ impl<'t, R: BytePeekRead> Ranger<'t, R> {
     }
 
     async fn next_is_sp(&mut self) -> Result<bool> {
-        Ok(match self.peek().await? {
-            b' ' | b'\t' => true,
-            _ => false,
-        })
+        Ok(b" \t".contains(&self.peek().await?))
     }
 
     async fn skip_sp(&mut self) -> Result<()> {
@@ -354,50 +511,24 @@ impl RequestLine {
     }
 }
 
-pub struct StatusLine(LineParts<2>);
+pub struct StatusLine(LineParts<3>);
 impl StatusLine {
     pub fn proto(&self) -> &[u8] {
         self.0.range(0)
     }
+    pub fn status_code(&self) -> &[u8] {
+        self.0.range(1)
+    }
     pub fn status(&self) -> &[u8] {
-        self.0.range(1)
+        self.0.range(2)
     }
     pub fn into_raw(self) -> Vec<u8> {
         self.0.raw
     }
 }
 
-pub struct Header(LineParts<2>);
-impl Header {
-    pub fn name(&self) -> &[u8] {
-        self.0.range(0)
-    }
-    pub fn value(&self) -> &[u8] {
-        self.0.range(1)
-    }
-    pub fn into_raw(self) -> Vec<u8> {
-        self.0.raw
-    }
-
-    pub fn is(&self, name: &[u8]) -> bool {
-        name.eq_ignore_ascii_case(self.name())
-    }
-    pub fn parse<T: str::FromStr>(&self) -> Result<T> {
-        (str::from_utf8(self.value()).ok())
-            .and_then(|s| s.parse().ok())
-            .ok_or(Error::InvalidInput)
-    }
-}
-
+#[derive(PartialEq, Eq, Debug)]
 pub enum HeaderRead {
-    Header(Header),
+    Name(Vec<u8>),
     EndOfHeader,
-}
-impl HeaderRead {
-    pub fn into_raw(self) -> Vec<u8> {
-        match self {
-            Self::Header(hdr) => hdr.into_raw(),
-            Self::EndOfHeader => b"\r\n".into(),
-        }
-    }
 }

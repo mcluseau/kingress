@@ -7,6 +7,7 @@ use log::{debug, error, info, trace, warn};
 use openssl::ssl;
 use std::{
     collections::BTreeMap as Map,
+    io::Cursor,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -257,40 +258,6 @@ where
 {
     let (mut sock_r, mut sock_w) = tokio::io::split(sock);
 
-    macro_rules! reply {
-        ($status:expr) => {{
-            let _ = sock_w.write(&http1::response::status($status)).await;
-            return;
-        }};
-        ($status:expr, $message:expr) => {{
-            let _ = sock_w
-                .write(&http1::response::plain($status, $message))
-                .await;
-            return;
-        }};
-    }
-    macro_rules! reply_bad_request {
-        ($message:expr) => {
-            reply!("400 Bad Request", $message)
-        };
-    }
-
-    use http1::{Error, HeaderRead};
-
-    macro_rules! http1_result {
-        ($e:expr, $limit_error:expr) => {
-            match $e.await {
-                Ok(e) => e,
-                Err(Error::LimitReached) => reply!($limit_error),
-                Err(Error::InvalidInput) => reply_bad_request!("invalid input"),
-                Err(e) => {
-                    debug!("{remote}: {}", e);
-                    return;
-                }
-            }
-        };
-    }
-
     let mut read = BufReader::with_capacity(4096, &mut sock_r);
     let mut prev = None;
 
@@ -306,27 +273,63 @@ where
             }
         }
 
+        macro_rules! reply {
+            ($status:ident) => {{
+                let _ = sock_w
+                    .write(&http1::response::status(http1::status::$status))
+                    .await;
+                continue 'main;
+            }};
+            ($status:ident, $message:expr) => {{
+                let _ = sock_w
+                    .write(&http1::response::plain(http1::status::$status, $message))
+                    .await;
+                continue 'main;
+            }};
+        }
+        macro_rules! reply_bad_request {
+            ($message:expr) => {
+                reply!(BAD_REQUEST, $message)
+            };
+        }
+
+        use http1::{Error, HeaderRead};
+
+        macro_rules! http1_result {
+            ($e:expr, $limit_error:ident) => {
+                match $e.await {
+                    Ok(e) => e,
+                    Err(Error::LimitReached) => reply!($limit_error),
+                    Err(Error::InvalidInput) => reply_bad_request!(b"invalid input"),
+                    Err(e) => {
+                        debug!("{remote}: {}", e);
+                        return;
+                    }
+                }
+            };
+        }
+
         let mut reader = http1::Reader::new(&mut read, Some(16 << 10));
 
-        let req_line = http1_result!(reader.request_line(8192), "414 URI Too Long");
+        let req_line = http1_result!(reader.request_line(8192), URI_TOO_LONG);
 
         let Ok(full_req_path) = std::str::from_utf8(req_line.path()) else {
-            reply_bad_request!("invalid path");
+            reply_bad_request!(b"invalid path");
         };
         let req_path = (full_req_path.find('?')).map_or(full_req_path, |i| &full_req_path[..i]);
 
-        let header = http1_result!(reader.header(512), "413 Content Too Large");
-        let header = match header {
-            HeaderRead::Header(hdr) => hdr,
-            HeaderRead::EndOfHeader => reply_bad_request!("no Host header"),
+        let header_name = match http1_result!(reader.header_name(), CONTENT_TOO_LARGE) {
+            HeaderRead::Name(n) => n,
+            HeaderRead::EndOfHeader => reply_bad_request!(b"no headers"),
         };
 
-        if !header.name().eq_ignore_ascii_case(b"host") {
-            reply_bad_request!("first header must be Host");
+        if !header_name.eq_ignore_ascii_case(b"host") {
+            reply_bad_request!(b"first header must be Host");
         }
 
-        let Ok(host) = std::str::from_utf8(header.value()) else {
-            reply_bad_request!("invalid host");
+        let host = http1_result!(reader.header_value(&header_name, 512), CONTENT_TOO_LARGE);
+        let Ok(host) = std::str::from_utf8(&host) else {
+            reply_bad_request!(b"invalid host");
         };
 
         let host = host.trim_ascii().to_lowercase();
@@ -336,11 +339,11 @@ where
         debug!("{remote}: requested {host} {req_path}");
 
         let Some(host_cfg) = ctx().host(host) else {
-            reply!("404 Not Found", "Unknown host");
+            reply!(NOT_FOUND, b"unknown host");
         };
 
         let Some(endpoint) = host_cfg.endpoint_for(req_path) else {
-            reply!("503 Service Unavailable");
+            reply!(SERVICE_UNAVAILABLE);
         };
 
         debug!("{remote}: mapped to {endpoint}");
@@ -351,35 +354,51 @@ where
             break 'main;
         }
 
+        let can_direct_copy = host_cfg.is_any_only()
+            && !endpoint.opts.forwarded_header
+            && !endpoint.opts.cors_allowed_origins.is_some();
+        let handle_cors = endpoint.opts.cors_allowed_origins.is_some()
+            && req_line.method().eq_ignore_ascii_case(b"OPTIONS");
+
         let mut initial_data = http1::Writer::new();
         initial_data.append(req_line.into_raw());
-        initial_data.append(header.into_raw());
+        initial_data.header("Host", host);
 
-        initial_data.header(
-            "Forwarded",
-            &format!("for=\"{remote}\";proto={forwarded_proto};host={host}"),
-        );
-        if LEGACY_XFORWARDED {
-            initial_data.header("X-Forwarded-For", &remote.to_string());
-            initial_data.header("X-Forwarded-Proto", forwarded_proto);
-            initial_data.header("X-Forwarded-Host", host);
+        if endpoint.opts.forwarded_header {
+            initial_data.header(
+                "Forwarded",
+                &format!("for=\"{remote}\";proto={forwarded_proto};host={host}"),
+            );
+            if LEGACY_XFORWARDED {
+                initial_data.header("X-Forwarded-For", &remote.to_string());
+                initial_data.header("X-Forwarded-Proto", forwarded_proto);
+                initial_data.header("X-Forwarded-Host", host);
+            }
         }
 
+        let mut req_is_cors = false;
+
         loop {
-            let header = http1_result!(reader.header(4096), "413 Content Too Large");
+            let header = http1_result!(reader.header_name(), CONTENT_TOO_LARGE);
 
             use http1::HeaderRead::*;
             match header {
-                Header(hdr) => {
-                    if hdr.is(b"Forwarded")
-                        || hdr.is(b"X-Forwarded-For")
-                        || hdr.is(b"X-Forwarded-Proto")
-                        || hdr.is(b"X-Forwarded-Host")
+                Name(hdr) => {
+                    if hdr.eq_ignore_ascii_case(b"Forwarded")
+                        || hdr.eq_ignore_ascii_case(b"X-Forwarded-For")
+                        || hdr.eq_ignore_ascii_case(b"X-Forwarded-Proto")
+                        || hdr.eq_ignore_ascii_case(b"X-Forwarded-Host")
                     {
+                        http1_result!(reader.skip_header_value(4096), CONTENT_TOO_LARGE);
                         continue;
                     }
 
-                    initial_data.append(hdr.into_raw());
+                    if handle_cors && hdr.eq_ignore_ascii_case(b"Access-Control-Request-Method") {
+                        req_is_cors = true;
+                    }
+
+                    let value = http1_result!(reader.header_value(&hdr, 4096), CONTENT_TOO_LARGE);
+                    initial_data.header_raw(&hdr, &value);
                 }
                 EndOfHeader => {
                     break;
@@ -390,6 +409,29 @@ where
         // finalize the header
         let initial_data = initial_data.done();
 
+        if req_is_cors {
+            let allowed = (endpoint.opts.cors_allowed_origins.iter().flatten())
+                .filter_map(|allow| glob::Pattern::new(allow).ok())
+                .any(|allow| allow.matches(host));
+
+            if !allowed {
+                reply!(FORBIDDEN, b"origin not allowed");
+            }
+
+            let mut resp = http1::Writer::new();
+            resp.status(http1::status::NO_CONTENT);
+            resp.header("Access-Control-Allow-Origin", host);
+            resp.header("Vary", "Access-Control-Request-Method");
+            resp.header("Vary", "Access-Control-Request-Headers");
+            resp.header("Access-Control-Allow-Credentials", "true");
+            resp.header("Access-Control-Allow-Headers", "*");
+            if let Err(e) = sock_w.write_all(&resp.done()).await {
+                debug!("{remote}: failed to write CORS reply: {e}");
+                break;
+            }
+            continue;
+        }
+
         let mut backend: Backend = 'b: {
             if let Some((prev_ep, mut prev_b)) = prev {
                 if prev_ep == endpoint {
@@ -398,28 +440,37 @@ where
                 }
                 // endpoint changed, close the previous connection
                 let _ = prev_b.shutdown().await;
+                prev = None;
             }
             match Backend::connect(&endpoint, ALPN_H1).await {
                 Ok((b, addr)) => {
                     debug!("{remote}: connected to backend {addr}");
                     b
                 }
-                Err(BackendError::LookupFailed) => reply!("503 Service Unavailable"),
-                Err(BackendError::ConnectFailed) => reply!("502 Bad Gateway"),
+                Err(BackendError::LookupFailed) => reply!(SERVICE_UNAVAILABLE),
+                Err(BackendError::ConnectFailed) => reply!(BAD_GATEWAY),
             }
         };
 
-        let req_content_length = reader.content_length;
+        if can_direct_copy {
+            // we can use direct copy (assuming the Host won't change)
+            let r = Cursor::new(initial_data).chain(read);
+            let mut client = io::join(r, sock_w);
 
-        let can_reuse = match req_content_length {
-            None => backend.forward(initial_data, &mut read, &mut sock_w).await,
-            Some(len) => {
-                let read = (&mut read).take(len);
-                backend.forward(initial_data, read, &mut sock_w).await
+            if let Err(e) = backend.copy_bidir(&mut client).await {
+                debug!("{remote}: forwarding to backend failed: {e}");
             }
-        };
+            return;
+        }
 
-        let can_reuse = can_reuse && req_content_length.is_some();
+        let req_content_length = reader.content_length();
+        let may_reuse_req = req_content_length.is_some();
+
+        let can_reuse = backend
+            .forward(&mut read, &mut sock_w, initial_data, req_content_length)
+            .await;
+
+        let can_reuse = can_reuse && may_reuse_req;
 
         prev = Some((endpoint, backend));
 
@@ -496,11 +547,22 @@ impl Backend {
         }
     }
 
+    async fn copy_bidir<RW>(&mut self, client: &mut RW) -> io::Result<(u64, u64)>
+    where
+        RW: AsyncRead + AsyncWrite + Unpin,
+    {
+        match self {
+            Self::TCP(backend) => io::copy_bidirectional(client, backend).await,
+            Self::SSL(backend) => io::copy_bidirectional(client, backend).await,
+        }
+    }
+
     async fn forward<CR, CW>(
         &mut self,
-        initial_data: Vec<u8>,
         client_read: CR,
         client_write: CW,
+        initial_data: Vec<u8>,
+        req_content_length: Option<u64>,
     ) -> bool
     where
         CR: AsyncBufRead + Unpin,
@@ -508,10 +570,24 @@ impl Backend {
     {
         match self {
             Self::TCP(backend) => {
-                forward_to_backend(initial_data, client_read, client_write, backend).await
+                forward_to_backend(
+                    client_read,
+                    client_write,
+                    backend,
+                    initial_data,
+                    req_content_length,
+                )
+                .await
             }
             Self::SSL(backend) => {
-                forward_to_backend(initial_data, client_read, client_write, backend).await
+                forward_to_backend(
+                    client_read,
+                    client_write,
+                    backend,
+                    initial_data,
+                    req_content_length,
+                )
+                .await
             }
         }
     }
@@ -538,16 +614,11 @@ async fn handle_http2_connection(
         return;
     };
 
-    let Ok((backend, backend_addr)) = Backend::connect(endpoint, ALPN_H2).await else {
+    let Ok((mut backend, backend_addr)) = Backend::connect(endpoint, ALPN_H2).await else {
         return;
     };
 
-    let copy_result = match backend {
-        Backend::TCP(mut backend) => io::copy_bidirectional(&mut stream, &mut backend).await,
-        Backend::SSL(mut backend) => io::copy_bidirectional(&mut stream, &mut backend).await,
-    };
-
-    if let Err(e) = copy_result {
+    if let Err(e) = backend.copy_bidir(&mut stream).await {
         warn!("{remote}: forwarding to {backend_addr} failed: {e}");
     }
 }
@@ -583,27 +654,47 @@ async fn connect_tls(
 
 /// forward client<->backend, returning true if the connections can be reused.
 async fn forward_to_backend<CR, CW, B>(
-    initial_data: Vec<u8>,
     mut client_read: CR,
     mut client_write: CW,
-    mut backend: B,
+    backend: B,
+    initial_data: Vec<u8>,
+    req_content_length: Option<u64>,
 ) -> bool
 where
     CR: AsyncBufRead + Unpin,
     CW: AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = backend.write(&initial_data).await {
-        let _ = (client_write.write(&http1::response::status("502 Bad Gateway"))).await;
-        debug!("error writing initial data: {e}");
+    let (backend_read, mut backend_write) = tokio::io::split(backend);
+
+    if let Err(e) = backend_write.write_all(&initial_data).await {
+        debug!("client->backend: failed to write initial data: {e}");
         return false;
     }
     drop(initial_data);
 
-    let (backend_read, mut backend_write) = tokio::io::split(backend);
     let mut backend_read = BufReader::new(backend_read);
 
-    let copy_req = tokio::io::copy_buf(&mut client_read, &mut backend_write);
+    let copy_req = async move {
+        match req_content_length {
+            None => {
+                let result = tokio::io::copy_buf(&mut client_read, &mut backend_write).await;
+                let _ = backend_write.shutdown().await;
+                result
+            }
+            Some(len) => {
+                let mut req_read = (&mut client_read).take(len);
+                let result = tokio::io::copy_buf(&mut req_read, &mut backend_write).await;
+                if let Err(ref e) = result {
+                    let _ = backend_write.shutdown().await;
+                } else if client_read.fill_buf().await.is_ok_and(|b| b.is_empty()) {
+                    // EOF
+                    let _ = backend_write.shutdown().await;
+                }
+                result
+            }
+        }
+    };
     pin!(copy_req);
 
     let mut copy_req_done = false;
@@ -716,14 +807,14 @@ where
     reader.status_line(512).await?;
 
     loop {
-        match reader.header(4096).await? {
+        match reader.header_name().await? {
             http1::HeaderRead::EndOfHeader => break,
-            _ => {}
+            http1::HeaderRead::Name(_) => reader.skip_header_value(4096).await?,
         }
     }
 
     // finished
-    let content_length = reader.content_length;
+    let content_length = reader.content_length();
     cbpr.flush().await?;
 
     Ok(content_length)
@@ -1032,6 +1123,9 @@ impl KeyValueFrom<networking::Ingress> for Ingress {
                 secure_backends: get_opt("secure-backends") == Some("true"),
                 ssl_redirect: get_opt("secure-backends") == Some("true"),
                 http2: get_opt("http2") == Some("true"),
+                forwarded_header: get_opt("forwarded-header") == Some("true"),
+                cors_allowed_origins: get_opt("cors-allowed-origins")
+                    .map(|s| s.split(",").map(|s| s.trim_ascii().to_string()).collect()),
             },
         })
     }

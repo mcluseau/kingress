@@ -43,7 +43,14 @@ impl std::fmt::Display for PortRef {
 pub struct EndpointOptions {
     pub secure_backends: bool,
     pub ssl_redirect: bool,
+    /// endpoint is HTTP/2 capable
     pub http2: bool,
+    /// handle the forwarded header.
+    /// Disables client<->endpoint direct copy as it wouldn't be consistent in keepalive cases.
+    pub forwarded_header: bool,
+    /// CORS allowed origins.
+    /// Disables client<->endpoint direct copy as it wouldn't be consistent in keepalive cases.
+    pub cors_allowed_origins: Option<Vec<String>>,
 }
 
 pub struct Context {
