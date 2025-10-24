@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +148,19 @@ func (h *oxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 
 		return
+	}
+
+	// enforce clean "Forwarded" headers
+	{
+		r.Header.Del("Forwarded")
+		r.Header.Del("X-Forwarded-For")
+		r.Header.Del("X-Forwarded-Proto")
+		r.Header.Del("X-Forwarded-Host")
+
+		r.Header.Set("Forwarded", "for="+strconv.Quote(r.RemoteAddr)+";proto="+r.URL.Scheme+";host="+r.URL.Host)
+		r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+		r.Header.Set("X-Forwarded-Proto", r.URL.Scheme)
+		r.Header.Set("X-Forwarded-Host", r.URL.Host)
 	}
 
 	r.URL.Host = backend.Target()
