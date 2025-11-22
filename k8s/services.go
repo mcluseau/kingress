@@ -62,22 +62,33 @@ func (_ servicesHandler) delete(svc *core.Service) {
 func findTargetPort(svcRef string, port intstr.IntOrString) (intstr.IntOrString, bool) {
 	ports := services[svcRef]
 
+	var selected *servicePort
 	switch port.Type {
 	case intstr.Int:
 		for _, svcPort := range ports {
 			if svcPort.Port == port.IntVal {
-				return svcPort.TargetPort, true
+				selected = &svcPort
+				break
 			}
 		}
 
 	case intstr.String:
 		for _, svcPort := range ports {
 			if svcPort.Name == port.StrVal {
-				return svcPort.TargetPort, true
+				selected = &svcPort
+				break
 			}
 		}
 
 	}
 
-	return intstr.FromString(""), false
+	if selected == nil {
+		return intstr.FromString(""), false
+	}
+
+	if selected.Name == "" {
+		return intstr.FromInt32(selected.Port), true
+	} else {
+		return intstr.FromString(selected.Name), true
+	}
 }
