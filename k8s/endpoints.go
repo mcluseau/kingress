@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	core "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/mcluseau/kingress/config"
 )
@@ -14,7 +13,6 @@ var (
 )
 
 type endpointSpec struct {
-	Port   int32
 	Name   string
 	Target string
 }
@@ -40,7 +38,6 @@ func (_ endpointsHandler) update(ep *core.Endpoints) {
 		for _, addr := range subset.Addresses {
 			for _, port := range subset.Ports {
 				eps = append(eps, endpointSpec{
-					Port:   port.Port,
 					Name:   port.Name,
 					Target: fmt.Sprintf("%s:%d", addr.IP, port.Port),
 				})
@@ -65,26 +62,15 @@ func (_ endpointsHandler) delete(ep *core.Endpoints) {
 	config.NotifyChanged(newConfig)
 }
 
-func findEndpoints(svcRef string, port intstr.IntOrString) []string {
+func findEndpoints(svcRef string, portName string) []string {
 	targets := make([]string, 0)
 
 	eps := endpoints[svcRef]
 
-	switch port.Type {
-	case intstr.Int:
-		for _, ep := range eps {
-			if ep.Port == port.IntVal {
-				targets = append(targets, ep.Target)
-			}
+	for _, ep := range eps {
+		if ep.Name == portName {
+			targets = append(targets, ep.Target)
 		}
-
-	case intstr.String:
-		for _, ep := range eps {
-			if ep.Name == port.StrVal {
-				targets = append(targets, ep.Target)
-			}
-		}
-
 	}
 
 	return targets

@@ -3,9 +3,11 @@ package k8s
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"sort"
 
 	"github.com/mcluseau/kingress/config"
+	"github.com/mcluseau/kingress/flags"
 )
 
 func newConfig() config.Config {
@@ -20,8 +22,8 @@ func newConfig() config.Config {
 			for _, backend := range backends {
 				if backend.Prefix == rule.Path {
 					errors = append(errors, fmt.Sprintf(
-						"warning: duplicate definition for host %s, path %v: ignoring ingress %s rule to %s:%s",
-						rule.Host, rule.Path, ingRef, rule.Service, rule.Port.String()))
+						"warning: duplicate definition for host %s, path %v: ignoring ingress %s rule to %s:%v",
+						rule.Host, rule.Path, ingRef, rule.Service, rule.Port))
 					continue rulesLoop
 				}
 			}
@@ -30,11 +32,17 @@ func newConfig() config.Config {
 			targetPort, ok := findTargetPort(rule.Service, rule.Port)
 			if !ok {
 				// we may log here but this kind of problem is visible in the endpoints
-				// log.Printf("no target for service %s, port %s (ingress: %s)", rule.Service, rule.Port.String(), ingRef)
+				if flags.Verbose {
+					log.Printf("no target for service %s, port %+v (ingress: %s)", rule.Service, rule.Port, ingRef)
+				}
 				continue
 			}
 
 			// build the backend from the service endpoints
+			endpoints := findEndpoints(rule.Service, targetPort)
+			if flags.Verbose && len(endpoints) == 0 {
+				log.Printf("no endpoints for service %s, port %+v", rule.Service, targetPort)
+			}
 			backend := config.NewBackend(ingRef, rule.Path, findEndpoints(rule.Service, targetPort)...)
 
 			if rule.Options != nil {
