@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/mcluseau/kingress/config"
+	"github.com/mcluseau/kingress/flags"
 )
 
 var (
@@ -54,6 +55,14 @@ func (h ingressHandler) OnDelete(obj any) {
 }
 
 func (h ingressHandler) update(ing *netv1.Ingress) {
+	if flags.IngressClass != "" {
+		if ing.Spec.IngressClassName == nil ||
+			flags.IngressClass != *ing.Spec.IngressClassName {
+			h.delete(ing)
+			return
+		}
+	}
+
 	ref := k8sRef(ing)
 
 	// parse ingress options
